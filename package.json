@@ -1,0 +1,54 @@
+{
+  "name": "pi-api-key-rotator",
+  "version": "0.1.0",
+  "description": "A Pi extension that safely rotates multiple API keys for a single provider endpoint.",
+  "type": "module",
+  "license": "MIT",
+  "author": "SH Jung",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sehoon123/pi-api-key-rotator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sehoon123/pi-api-key-rotator/issues"
+  },
+  "homepage": "https://github.com/sehoon123/pi-api-key-rotator#readme",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "api-key",
+    "rotation",
+    "rate-limit",
+    "failover"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "config.example.json"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}

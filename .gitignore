@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+dist/
+*.log
+*.tmp
+.env
+key-rotator.json
+*.state.json
+*.state.json.lock
+.DS_Store
+Thumbs.db
