@@ -6,6 +6,8 @@ import type { RawRotatorConfig, RotatorConfig } from "./types.ts";
 const DEFAULT_RETRY_STATUSES = [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504] as const;
 const DEFAULT_DISABLE_STATUSES = [401, 402, 403] as const;
 const DEFAULT_COOLDOWN_STATUSES = [429] as const;
+const LITERAL_SOURCE_MARKER = "<literal>";
+const MAX_SECRET_LENGTH = 65_536;
 
 export const DEFAULT_CONFIG_FILE = join("~", ".pi", "agent", "key-rotator.json");
 
@@ -58,6 +60,27 @@ function requireString(value: unknown, field: string, configFile: string): strin
     throw new ConfigValidationError(configFile, `"${field}" must be a non-empty string.`);
   }
   return value.trim();
+}
+
+/**
+ * Validate a secret without ever embedding it in an error. Trimming secrets is
+ * intentionally forbidden rather than automatic because silently changing a
+ * credential produces hard-to-diagnose authentication failures.
+ */
+function requireSecret(value: unknown, field: string, configFile: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.trim().length === 0) {
+    throw new ConfigValidationError(configFile, `"${field}" must be a non-empty string.`);
+  }
+  if (value !== value.trim()) {
+    throw new ConfigValidationError(configFile, `"${field}" must not contain leading or trailing whitespace.`);
+  }
+  if (value.length > MAX_SECRET_LENGTH) {
+    throw new ConfigValidationError(configFile, `"${field}" exceeds the maximum supported length.`);
+  }
+  if (/[\u0000-\u001F\u007F-\u009F]/u.test(value)) {
+    throw new ConfigValidationError(configFile, `"${field}" must not contain control characters.`);
+  }
+  return value;
 }
 
 function integerInRange(
@@ -116,13 +139,30 @@ function ensureSubset(
   }
 }
 
+/**
+ * Recent Node versions may include a source excerpt in JSON.parse errors. A
+ * literal API key could be located in that excerpt, so only retain positional
+ * information and discard all source text.
+ */
+function safeJsonParseDetail(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const lineColumn = message.match(/line\s+(\d+)\s+column\s+(\d+)/i);
+  if (lineColumn) return `JSON parsing failed near line ${lineColumn[1]}, column ${lineColumn[2]}.`;
+
+  const position = message.match(/position\s+(\d+)/i);
+  if (position) return `JSON parsing failed near character ${position[1]}.`;
+  return "JSON parsing failed.";
+}
+
 function parseJson(text: string, configFile: string): RawRotatorConfig {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    // Some Windows editors emit an UTF-8 BOM. JSON.parse rejects it even when
+    // the remainder of the file is valid JSON.
+    const normalizedText = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+    parsed = JSON.parse(normalizedText);
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new ConfigValidationError(configFile, `JSON parsing failed: ${detail}`);
+    throw new ConfigValidationError(configFile, safeJsonParseDetail(error));
   }
 
   if (!isRecord(parsed)) {
@@ -145,7 +185,7 @@ export function resolveConfig(
 
   const ids = new Set<string>();
   const envNames = new Set<string>();
-  const secretFingerprints = new Set<string>();
+  const secretOwners = new Map<string, string>();
   const missingEnvNames: string[] = [];
 
   const keys = raw.keys.map((entry, index) => {
@@ -154,37 +194,63 @@ export function resolveConfig(
     }
 
     const id = requireString(entry.id, `keys[${index}].id`, configFile);
-    const envName = requireString(entry.env, `keys[${index}].env`, configFile);
-
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
       throw new ConfigValidationError(
         configFile,
         `keys[${index}].id must be 1-64 characters using letters, digits, dot, underscore, or hyphen.`,
       );
     }
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
-      throw new ConfigValidationError(configFile, `keys[${index}].env is not a valid environment variable name.`);
-    }
     if (ids.has(id)) {
       throw new ConfigValidationError(configFile, `Duplicate key id: ${id}`);
     }
-    if (envNames.has(envName)) {
-      throw new ConfigValidationError(configFile, `Duplicate environment variable reference: ${envName}`);
-    }
+    ids.add(id);
 
-    const value = env[envName]?.trim() ?? "";
-    if (value.length === 0) missingEnvNames.push(envName);
-    if (value.length > 0 && secretFingerprints.has(value)) {
+    // Object.hasOwn is intentional: { value: null } is a supplied-but-invalid
+    // literal value, not the same as omitting the property.
+    const hasEnv = Object.hasOwn(entry, "env");
+    const hasValue = Object.hasOwn(entry, "value");
+    if (hasEnv === hasValue) {
       throw new ConfigValidationError(
         configFile,
-        `Two entries resolve to the same secret value. Check the environment variables near ${envName}.`,
+        `keys[${index}] (${id}) must specify exactly one of "env" or "value".`,
       );
     }
 
-    ids.add(id);
-    envNames.add(envName);
-    if (value.length > 0) secretFingerprints.add(value);
-    return { id, env: envName, value };
+    if (hasEnv) {
+      const envName = requireString(entry.env, `keys[${index}].env`, configFile);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+        throw new ConfigValidationError(configFile, `keys[${index}].env is not a valid environment variable name.`);
+      }
+      if (envNames.has(envName)) {
+        throw new ConfigValidationError(configFile, `Duplicate environment variable reference: ${envName}`);
+      }
+      envNames.add(envName);
+
+      const rawValue = env[envName];
+      const value =
+        typeof rawValue === "string" && rawValue.trim().length > 0
+          ? requireSecret(rawValue, `environment variable ${envName}`, configFile)
+          : "";
+      if (value.length === 0) missingEnvNames.push(envName);
+
+      const previousOwner = value.length > 0 ? secretOwners.get(value) : undefined;
+      if (previousOwner) {
+        throw new ConfigValidationError(configFile, `Key "${id}" resolves to the same secret value as key "${previousOwner}".`);
+      }
+      if (value.length > 0) secretOwners.set(value, id);
+      return { id, env: envName, value };
+    }
+
+    const value = requireSecret(entry.value, `keys[${index}].value`, configFile);
+    const previousOwner = secretOwners.get(value);
+    if (previousOwner) {
+      throw new ConfigValidationError(configFile, `Key "${id}" resolves to the same secret value as key "${previousOwner}".`);
+    }
+    secretOwners.set(value, id);
+
+    // Never put the secret itself in state/status metadata. Existing status code
+    // can safely render this non-secret marker without additional branching.
+    return { id, env: LITERAL_SOURCE_MARKER, value };
   });
 
   if (missingEnvNames.length > 0) {
@@ -258,7 +324,8 @@ export function resolveConfig(
 export async function loadConfig(options: LoadConfigOptions = {}): Promise<RotatorConfig> {
   const env = options.env ?? process.env;
   const homeDir = options.homeDir ?? homedir();
-  const requestedPath = options.configFile ?? env.PI_KEY_ROTATOR_CONFIG ?? DEFAULT_CONFIG_FILE;
+  const environmentPath = env.PI_KEY_ROTATOR_CONFIG?.trim();
+  const requestedPath = options.configFile ?? (environmentPath ? environmentPath : DEFAULT_CONFIG_FILE);
   const configFile = resolvePath(requestedPath, homeDir);
 
   let text: string;
