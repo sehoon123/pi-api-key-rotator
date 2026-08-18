@@ -6,6 +6,7 @@ import type {
   ExtensionContextLike,
   ModelLike,
   PoolSnapshot,
+  ResolvedKeyDefinition,
   RotatorConfig,
   StreamSimpleLike,
 } from "./types.ts";
@@ -40,6 +41,33 @@ function duration(milliseconds: number): string {
   return `${Math.ceil(minutes / 60)}h`;
 }
 
+/**
+ * Pi provider config values treat a leading `!` as a command and `$NAME` as
+ * environment interpolation. Escape those metacharacters when a literal key
+ * must be used as the provider's fallback authentication value.
+ */
+export function escapePiConfigLiteral(value: string): string {
+  const escapedDollars = value.replaceAll("$", () => "$$");
+  return escapedDollars.startsWith("!") ? `$${escapedDollars}` : escapedDollars;
+}
+
+export function fallbackApiKey(key: ResolvedKeyDefinition): string {
+  // v0.1 programmatic configs did not carry `source`; an env name therefore
+  // remains sufficient unless the explicit v0.2 source says the key is literal.
+  if (key.env && key.env !== "<literal>" && key.source !== "literal") return `$${key.env}`;
+  return escapePiConfigLiteral(key.value);
+}
+
+function configuredTargets(config: Pick<RotatorConfig, "provider" | "api" | "targets">) {
+  return config.targets?.length
+    ? config.targets
+    : [{ provider: config.provider, api: config.api }];
+}
+
+function configuredPoolId(config: Pick<RotatorConfig, "provider" | "poolId">): string {
+  return config.poolId ?? config.provider;
+}
+
 export function compactStatus(snapshot: PoolSnapshot, now = Date.now()): string {
   const current = snapshot.keys.find((key) => key.id === snapshot.currentKeyId);
   if (!current) return "keys: unavailable";
@@ -48,11 +76,22 @@ export function compactStatus(snapshot: PoolSnapshot, now = Date.now()): string 
   return `keys: ${current.id} ${snapshot.requestsOnCurrent}/${snapshot.requestsPerKey}`;
 }
 
-export function formatStatus(snapshot: PoolSnapshot, provider: string, now = Date.now()): string {
+export function formatStatus(
+  snapshot: PoolSnapshot,
+  configOrProvider: string | Pick<RotatorConfig, "provider" | "api" | "poolId" | "targets">,
+  now = Date.now(),
+): string {
+  const poolId = typeof configOrProvider === "string" ? configOrProvider : configuredPoolId(configOrProvider);
+  const targets =
+    typeof configOrProvider === "string"
+      ? [{ provider: configOrProvider, api: "configured adapter" }]
+      : configuredTargets(configOrProvider);
   const lines = [
-    `Provider: ${provider}`,
+    `Pool: ${poolId}`,
+    "Targets:",
+    ...targets.map((target) => `  - ${target.provider} (${target.api})`),
     `Current: ${snapshot.currentKeyId} (${snapshot.requestsOnCurrent}/${snapshot.requestsPerKey})`,
-    `Total HTTP attempts: ${snapshot.totalAttempts}`,
+    `Total provider attempts: ${snapshot.totalAttempts}`,
     "",
   ];
 
@@ -73,6 +112,9 @@ export function registerKeyRotatorExtension(
   dependencies: RegisterExtensionDependencies,
 ): void {
   const { config, pool } = dependencies;
+  const firstKey = config.keys[0];
+  if (!firstKey) throw new Error("Key rotator requires at least one resolved API key.");
+
   let activeUi: ExtensionContextLike["ui"] | undefined;
 
   const refreshStatus = async (snapshot?: PoolSnapshot): Promise<void> => {
@@ -89,35 +131,46 @@ export function registerKeyRotatorExtension(
     onStateChange: refreshStatus,
   });
 
-  // A fallback API key reference keeps Pi's provider authentication check
-  // satisfied. Every actual request is overridden by the rotating stream.
-  pi.registerProvider(config.provider, {
-    api: config.api,
-    apiKey: `$${config.keys[0]?.env ?? ""}`,
-    streamSimple: rotatingStream,
-  });
+  const targets = configuredTargets(config);
+  const poolId = configuredPoolId(config);
+  const providerFallback = fallbackApiKey(firstKey);
+  for (const target of targets) {
+    // Every target receives the same stream and KeyPool instance. Therefore
+    // attempts, rotation thresholds, cooldowns, and disabled keys are shared
+    // across all configured provider/API pairs.
+    pi.registerProvider(target.provider, {
+      api: target.api,
+      apiKey: providerFallback,
+      streamSimple: rotatingStream,
+    });
+  }
+
+  const targetsByProvider = new Map(targets.map((target) => [target.provider, target] as const));
 
   pi.registerCommand("key-rotator", {
-    description: "Show, advance, or reset the API key rotation pool",
+    description: "Show, advance, or reset the shared API key rotation pool",
     handler: async (args, ctx) => {
       activeUi = ctx.ui;
       const action = args.trim().toLowerCase() || "status";
 
       if (action === "status") {
         const snapshot = await pool.snapshot();
-        ctx.ui.notify(formatStatus(snapshot, config.provider), "info");
+        ctx.ui.notify(formatStatus(snapshot, config), "info");
         await refreshStatus(snapshot);
         return;
       }
       if (action === "next") {
         const snapshot = await pool.advance();
-        ctx.ui.notify(`Advanced to ${snapshot.currentKeyId}.`, "info");
+        ctx.ui.notify(`Advanced pool "${poolId}" to ${snapshot.currentKeyId}.`, "info");
         await refreshStatus(snapshot);
         return;
       }
       if (action === "reset") {
         const snapshot = await pool.reset();
-        ctx.ui.notify("All disabled/cooldown states and counters were reset.", "warning");
+        ctx.ui.notify(
+          `Reset counters, cooldowns, and disabled states for pool "${poolId}".`,
+          "warning",
+        );
         await refreshStatus(snapshot);
         return;
       }
@@ -134,10 +187,11 @@ export function registerKeyRotatorExtension(
   pi.on("model_select", async (event, ctx) => {
     activeUi = ctx.ui;
     const model = extractModel(event);
-    if (model?.provider === config.provider && model.api !== config.api) {
+    const target = model ? targetsByProvider.get(model.provider) : undefined;
+    if (model && target && model.api !== target.api) {
       ctx.ui.notify(
-        `Key rotator is configured for API "${config.api}", but the selected model uses "${model.api}". ` +
-          "Update key-rotator.json so the API values match.",
+        `Key rotator target "${target.provider}" expects API "${target.api}", ` +
+          `but the selected model uses "${model.api}". Update key-rotator.json or models.json so the API values match.`,
         "error",
       );
     }

@@ -1,3 +1,8 @@
+export interface RotatorTarget {
+  provider: string;
+  api: string;
+}
+
 export interface EnvKeyDefinition {
   id: string;
   env: string;
@@ -10,15 +15,20 @@ export interface LiteralKeyDefinition {
   env?: never;
 }
 
-/**
- * A key definition must use exactly one source. Runtime validation enforces
- * this rule as JSON callers are not protected by TypeScript's union type.
- */
+/** A key definition must use exactly one secret source. */
 export type KeyDefinition = EnvKeyDefinition | LiteralKeyDefinition;
 
 export interface RawRotatorConfig {
-  provider: string;
-  api: string;
+  /** Optional stable identifier used for the default state-file name. */
+  poolId?: string;
+
+  /** Legacy single-target form. Must be used together and without `targets`. */
+  provider?: string;
+  api?: string;
+
+  /** Multi-target form. Every target shares the same key pool and counters. */
+  targets?: RotatorTarget[];
+
   keys: KeyDefinition[];
   requestsPerKey?: number;
   maxAttemptsPerRequest?: number;
@@ -34,21 +44,27 @@ export interface RawRotatorConfig {
   staleLockMs?: number;
 }
 
-/**
- * Internal normalized representation. `env` is the environment variable name
- * for env-backed keys and the non-secret marker `<literal>` for keys supplied
- * through `value`. Keeping this normalized shape preserves compatibility with
- * the state/status layer while never placing the actual secret in metadata.
- */
+export type KeySource = "env" | "literal";
+
 export interface ResolvedKeyDefinition {
   id: string;
-  env: string;
+  /** Optional so pre-v0.2 programmatic configs remain source compatible. */
+  source?: KeySource;
+  env?: string;
   value: string;
 }
 
 export interface RotatorConfig {
+  /** Resolved configs always set this; optional preserves programmatic v0.1 compatibility. */
+  poolId?: string;
+  /** Resolved configs always set this; optional preserves programmatic v0.1 compatibility. */
+  targets?: RotatorTarget[];
+
+  /** @deprecated Compatibility alias for the first target. */
   provider: string;
+  /** @deprecated Compatibility alias for the first target. */
   api: string;
+
   keys: ResolvedKeyDefinition[];
   requestsPerKey: number;
   maxAttemptsPerRequest: number;
@@ -88,7 +104,9 @@ export interface PoolState {
 
 export interface SelectedKey {
   id: string;
-  env: string;
+  /** Optional for compatibility with the legacy KeyPool metadata shape. */
+  source?: KeySource;
+  env?: string | undefined;
   value: string;
   ordinal: number;
   attemptNumber: number;
@@ -96,7 +114,9 @@ export interface SelectedKey {
 
 export interface KeyStatusSnapshot extends KeyRuntimeState {
   id: string;
-  env: string;
+  /** Optional for compatibility with state snapshots created before v0.2. */
+  source?: KeySource;
+  env?: string | undefined;
   current: boolean;
   available: boolean;
 }
@@ -197,4 +217,40 @@ export type StreamSimpleLike = (
 
 export interface EventStreamFactory {
   (): AssistantEventStreamLike;
+}
+
+export interface ExtensionUiLike {
+  notify(message: string, type?: "info" | "warning" | "error"): void;
+  setStatus(key: string, text: string | undefined): void;
+}
+
+export interface ExtensionContextLike {
+  ui: ExtensionUiLike;
+  model?: ModelLike;
+}
+
+export interface ExtensionApiLike {
+  registerProvider(
+    name: string,
+    config: {
+      api: string;
+      apiKey: string;
+      streamSimple: StreamSimpleLike;
+    },
+  ): void;
+  registerCommand(
+    name: string,
+    options: {
+      description: string;
+      handler: (args: string, ctx: ExtensionContextLike) => Promise<void> | void;
+    },
+  ): void;
+  on(
+    event: "session_start" | "model_select" | "session_shutdown",
+    handler: (event: unknown, ctx: ExtensionContextLike) => Promise<void> | void,
+  ): void;
+}
+
+export interface Clock {
+  now(): number;
 }
