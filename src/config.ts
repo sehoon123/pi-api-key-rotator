@@ -1,12 +1,19 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { RawRotatorConfig, RotatorConfig } from "./types.ts";
+import type {
+  KeySource,
+  RawRotatorConfig,
+  ResolvedKeyDefinition,
+  RotatorConfig,
+  RotatorTarget,
+} from "./types.ts";
 
 const DEFAULT_RETRY_STATUSES = [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504] as const;
 const DEFAULT_DISABLE_STATUSES = [401, 402, 403] as const;
 const DEFAULT_COOLDOWN_STATUSES = [429] as const;
-const LITERAL_SOURCE_MARKER = "<literal>";
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_SECRET_LENGTH = 65_536;
 
 export const DEFAULT_CONFIG_FILE = join("~", ".pi", "agent", "key-rotator.json");
@@ -62,11 +69,25 @@ function requireString(value: unknown, field: string, configFile: string): strin
   return value.trim();
 }
 
-/**
- * Validate a secret without ever embedding it in an error. Trimming secrets is
- * intentionally forbidden rather than automatic because silently changing a
- * credential produces hard-to-diagnose authentication failures.
- */
+function requireIdentifier(value: unknown, field: string, configFile: string): string {
+  const identifier = requireString(value, field, configFile);
+  if (!IDENTIFIER_PATTERN.test(identifier)) {
+    throw new ConfigValidationError(
+      configFile,
+      `"${field}" must be 1-64 characters using letters, digits, dot, underscore, or hyphen.`,
+    );
+  }
+  return identifier;
+}
+
+function defaultPoolId(provider: string): string {
+  const sanitized = provider
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[^A-Za-z0-9]+/g, "")
+    .slice(0, 64);
+  return IDENTIFIER_PATTERN.test(sanitized) ? sanitized : "default";
+}
+
 function requireSecret(value: unknown, field: string, configFile: string): string {
   if (typeof value !== "string" || value.length === 0 || value.trim().length === 0) {
     throw new ConfigValidationError(configFile, `"${field}" must be a non-empty string.`);
@@ -74,11 +95,11 @@ function requireSecret(value: unknown, field: string, configFile: string): strin
   if (value !== value.trim()) {
     throw new ConfigValidationError(configFile, `"${field}" must not contain leading or trailing whitespace.`);
   }
+  if (/[\u0000-\u001F\u007F]/u.test(value)) {
+    throw new ConfigValidationError(configFile, `"${field}" must not contain control characters.`);
+  }
   if (value.length > MAX_SECRET_LENGTH) {
     throw new ConfigValidationError(configFile, `"${field}" exceeds the maximum supported length.`);
-  }
-  if (/[\u0000-\u001F\u007F-\u009F]/u.test(value)) {
-    throw new ConfigValidationError(configFile, `"${field}" must not contain control characters.`);
   }
   return value;
 }
@@ -139,11 +160,6 @@ function ensureSubset(
   }
 }
 
-/**
- * Recent Node versions may include a source excerpt in JSON.parse errors. A
- * literal API key could be located in that excerpt, so only retain positional
- * information and discard all source text.
- */
 function safeJsonParseDetail(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const lineColumn = message.match(/line\s+(\d+)\s+column\s+(\d+)/i);
@@ -157,11 +173,12 @@ function safeJsonParseDetail(error: unknown): string {
 function parseJson(text: string, configFile: string): RawRotatorConfig {
   let parsed: unknown;
   try {
-    // Some Windows editors emit an UTF-8 BOM. JSON.parse rejects it even when
-    // the remainder of the file is valid JSON.
+    // UTF-8 BOMs are common in files written by some Windows editors.
     const normalizedText = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
     parsed = JSON.parse(normalizedText);
   } catch (error) {
+    // Node may include a source excerpt in SyntaxError messages. A literal API
+    // key can appear in that excerpt, so only retain non-secret location data.
     throw new ConfigValidationError(configFile, safeJsonParseDetail(error));
   }
 
@@ -171,14 +188,65 @@ function parseJson(text: string, configFile: string): RawRotatorConfig {
   return parsed as unknown as RawRotatorConfig;
 }
 
-export function resolveConfig(
-  raw: RawRotatorConfig,
-  options: Required<Pick<LoadConfigOptions, "env" | "homeDir">> & { configFile: string },
-): RotatorConfig {
-  const { configFile, env, homeDir } = options;
-  const provider = requireString(raw.provider, "provider", configFile);
-  const api = requireString(raw.api, "api", configFile);
+function resolveTargets(raw: RawRotatorConfig, configFile: string): RotatorTarget[] {
+  const hasTargets = Object.hasOwn(raw, "targets");
+  const hasProvider = Object.hasOwn(raw, "provider");
+  const hasApi = Object.hasOwn(raw, "api");
 
+  if (hasTargets && (hasProvider || hasApi)) {
+    throw new ConfigValidationError(
+      configFile,
+      'Use either legacy "provider"/"api" fields or the "targets" array, not both.',
+    );
+  }
+
+  let targets: RotatorTarget[];
+  if (hasTargets) {
+    if (!Array.isArray(raw.targets) || raw.targets.length === 0) {
+      throw new ConfigValidationError(configFile, '"targets" must contain at least one provider/API definition.');
+    }
+
+    targets = raw.targets.map((entry, index) => {
+      if (!isRecord(entry)) {
+        throw new ConfigValidationError(configFile, `targets[${index}] must be an object.`);
+      }
+      return {
+        provider: requireString(entry.provider, `targets[${index}].provider`, configFile),
+        api: requireString(entry.api, `targets[${index}].api`, configFile),
+      };
+    });
+  } else {
+    if (hasProvider !== hasApi) {
+      throw new ConfigValidationError(configFile, 'Legacy "provider" and "api" must be specified together.');
+    }
+    if (!hasProvider) {
+      throw new ConfigValidationError(
+        configFile,
+        'Specify either legacy "provider"/"api" fields or a non-empty "targets" array.',
+      );
+    }
+    targets = [
+      {
+        provider: requireString(raw.provider, "provider", configFile),
+        api: requireString(raw.api, "api", configFile),
+      },
+    ];
+  }
+
+  const providerIds = new Set<string>();
+  for (const target of targets) {
+    if (providerIds.has(target.provider)) {
+      throw new ConfigValidationError(
+        configFile,
+        `Provider "${target.provider}" appears more than once in "targets". Each Pi provider can be registered only once.`,
+      );
+    }
+    providerIds.add(target.provider);
+  }
+  return targets;
+}
+
+function resolveKeys(raw: RawRotatorConfig, configFile: string, env: NodeJS.ProcessEnv): ResolvedKeyDefinition[] {
   if (!Array.isArray(raw.keys) || raw.keys.length < 2) {
     throw new ConfigValidationError(configFile, '"keys" must contain at least two key definitions.');
   }
@@ -188,25 +256,17 @@ export function resolveConfig(
   const secretOwners = new Map<string, string>();
   const missingEnvNames: string[] = [];
 
-  const keys = raw.keys.map((entry, index) => {
+  const keys = raw.keys.map((entry, index): ResolvedKeyDefinition => {
     if (!isRecord(entry)) {
       throw new ConfigValidationError(configFile, `keys[${index}] must be an object.`);
     }
 
-    const id = requireString(entry.id, `keys[${index}].id`, configFile);
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
-      throw new ConfigValidationError(
-        configFile,
-        `keys[${index}].id must be 1-64 characters using letters, digits, dot, underscore, or hyphen.`,
-      );
-    }
+    const id = requireIdentifier(entry.id, `keys[${index}].id`, configFile);
     if (ids.has(id)) {
       throw new ConfigValidationError(configFile, `Duplicate key id: ${id}`);
     }
     ids.add(id);
 
-    // Object.hasOwn is intentional: { value: null } is a supplied-but-invalid
-    // literal value, not the same as omitting the property.
     const hasEnv = Object.hasOwn(entry, "env");
     const hasValue = Object.hasOwn(entry, "value");
     if (hasEnv === hasValue) {
@@ -216,9 +276,14 @@ export function resolveConfig(
       );
     }
 
+    let source: KeySource;
+    let envName: string | undefined;
+    let value: string;
+
     if (hasEnv) {
-      const envName = requireString(entry.env, `keys[${index}].env`, configFile);
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+      source = "env";
+      envName = requireString(entry.env, `keys[${index}].env`, configFile);
+      if (!ENV_NAME_PATTERN.test(envName)) {
         throw new ConfigValidationError(configFile, `keys[${index}].env is not a valid environment variable name.`);
       }
       if (envNames.has(envName)) {
@@ -227,30 +292,34 @@ export function resolveConfig(
       envNames.add(envName);
 
       const rawValue = env[envName];
-      const value =
-        typeof rawValue === "string" && rawValue.trim().length > 0
-          ? requireSecret(rawValue, `environment variable ${envName}`, configFile)
-          : "";
-      if (value.length === 0) missingEnvNames.push(envName);
-
-      const previousOwner = value.length > 0 ? secretOwners.get(value) : undefined;
-      if (previousOwner) {
-        throw new ConfigValidationError(configFile, `Key "${id}" resolves to the same secret value as key "${previousOwner}".`);
+      if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
+        missingEnvNames.push(envName);
+        value = "";
+      } else {
+        value = requireSecret(rawValue, `environment variable ${envName}`, configFile);
       }
-      if (value.length > 0) secretOwners.set(value, id);
-      return { id, env: envName, value };
+    } else {
+      source = "literal";
+      value = requireSecret(entry.value, `keys[${index}].value`, configFile);
     }
 
-    const value = requireSecret(entry.value, `keys[${index}].value`, configFile);
-    const previousOwner = secretOwners.get(value);
-    if (previousOwner) {
-      throw new ConfigValidationError(configFile, `Key "${id}" resolves to the same secret value as key "${previousOwner}".`);
+    if (value.length > 0) {
+      const previousOwner = secretOwners.get(value);
+      if (previousOwner) {
+        throw new ConfigValidationError(
+          configFile,
+          `Key "${id}" resolves to the same secret value as key "${previousOwner}".`,
+        );
+      }
+      secretOwners.set(value, id);
     }
-    secretOwners.set(value, id);
 
-    // Never put the secret itself in state/status metadata. Existing status code
-    // can safely render this non-secret marker without additional branching.
-    return { id, env: LITERAL_SOURCE_MARKER, value };
+    return {
+      id,
+      source,
+      env: envName ?? "<literal>",
+      value,
+    };
   });
 
   if (missingEnvNames.length > 0) {
@@ -259,6 +328,26 @@ export function resolveConfig(
       `Missing or empty environment variables: ${missingEnvNames.join(", ")}.`,
     );
   }
+  return keys;
+}
+
+export function resolveConfig(
+  raw: RawRotatorConfig,
+  options: Required<Pick<LoadConfigOptions, "env" | "homeDir">> & { configFile: string },
+): RotatorConfig {
+  const { configFile, env, homeDir } = options;
+  const targets = resolveTargets(raw, configFile);
+  const primaryTarget = targets[0];
+  if (!primaryTarget) {
+    // Kept as a defensive invariant even though resolveTargets rejects this.
+    throw new ConfigValidationError(configFile, "No provider targets were resolved.");
+  }
+
+  const poolId =
+    raw.poolId === undefined
+      ? defaultPoolId(primaryTarget.provider)
+      : requireIdentifier(raw.poolId, "poolId", configFile);
+  const keys = resolveKeys(raw, configFile, env);
 
   const requestsPerKey = integerInRange(raw.requestsPerKey, 20, "requestsPerKey", 1, 1_000_000, configFile);
   const maxAttemptsPerRequest = integerInRange(
@@ -296,14 +385,16 @@ export function resolveConfig(
   ensureSubset(cooldownStatuses, retryStatuses, "cooldownStatuses", "retryStatuses", configFile);
 
   const configuredStateFile =
-    typeof raw.stateFile === "string" && raw.stateFile.trim().length > 0
-      ? raw.stateFile.trim()
-      : join("~", ".pi", "agent", `key-rotator-${provider.replace(/[^A-Za-z0-9._-]+/g, "-")}.state.json`);
+    raw.stateFile === undefined
+      ? join("~", ".pi", "agent", `key-rotator-${poolId}.state.json`)
+      : requireString(raw.stateFile, "stateFile", configFile);
   const stateFile = resolvePath(configuredStateFile, homeDir, dirname(configFile));
 
   return {
-    provider,
-    api,
+    poolId,
+    targets,
+    provider: primaryTarget.provider,
+    api: primaryTarget.api,
     keys,
     requestsPerKey,
     maxAttemptsPerRequest,

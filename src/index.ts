@@ -5,7 +5,13 @@ import { ConfigNotFoundError, loadConfig } from "./config.ts";
 import { registerKeyRotatorExtension } from "./extension.ts";
 import { createInitialPoolState, KeyPool } from "./key-pool.ts";
 import { JsonFileStateStore } from "./state-store.ts";
-import type { EventStreamFactory, ExtensionApiLike, PoolState, StreamSimpleLike } from "./types.ts";
+import type {
+  EventStreamFactory,
+  ExtensionApiLike,
+  PoolState,
+  RotatorConfig,
+  StreamSimpleLike,
+} from "./types.ts";
 
 function registerDisabledCommand(pi: ExtensionAPI, message: string): void {
   console.warn(`[pi-api-key-rotator] ${message}`);
@@ -24,13 +30,13 @@ function registerDisabledCommand(pi: ExtensionAPI, message: string): void {
 }
 
 export default async function apiKeyRotatorExtension(pi: ExtensionAPI): Promise<void> {
-  let config;
+  let config: RotatorConfig;
   try {
     config = await loadConfig();
   } catch (error) {
     const message =
       error instanceof ConfigNotFoundError
-        ? `Configuration is missing at ${error.configFile}. Copy config.example.json there, set the key environment variables, and run /reload.`
+        ? `Configuration is missing at ${error.configFile}. Copy an example config there, add at least two API keys, and run /reload.`
         : `Extension is disabled because configuration loading failed: ${error instanceof Error ? error.message : String(error)}`;
     registerDisabledCommand(pi, message);
     return;

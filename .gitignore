@@ -14,6 +14,10 @@ key-rotator.local.json
 **/key-rotator.local.json
 config.literal.local.json
 **/config.literal.local.json
+config.ibm-ica.local.json
+**/config.ibm-ica.local.json
+*.secrets.json
+**/*.secrets.json
 
 # Runtime state
 *.state.json
