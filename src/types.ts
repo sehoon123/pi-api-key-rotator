@@ -1,7 +1,20 @@
-export interface KeyDefinition {
+export interface EnvKeyDefinition {
   id: string;
   env: string;
+  value?: never;
 }
+
+export interface LiteralKeyDefinition {
+  id: string;
+  value: string;
+  env?: never;
+}
+
+/**
+ * A key definition must use exactly one source. Runtime validation enforces
+ * this rule as JSON callers are not protected by TypeScript's union type.
+ */
+export type KeyDefinition = EnvKeyDefinition | LiteralKeyDefinition;
 
 export interface RawRotatorConfig {
   provider: string;
@@ -21,7 +34,15 @@ export interface RawRotatorConfig {
   staleLockMs?: number;
 }
 
-export interface ResolvedKeyDefinition extends KeyDefinition {
+/**
+ * Internal normalized representation. `env` is the environment variable name
+ * for env-backed keys and the non-secret marker `<literal>` for keys supplied
+ * through `value`. Keeping this normalized shape preserves compatibility with
+ * the state/status layer while never placing the actual secret in metadata.
+ */
+export interface ResolvedKeyDefinition {
+  id: string;
+  env: string;
   value: string;
 }
 
@@ -176,40 +197,4 @@ export type StreamSimpleLike = (
 
 export interface EventStreamFactory {
   (): AssistantEventStreamLike;
-}
-
-export interface ExtensionUiLike {
-  notify(message: string, type?: "info" | "warning" | "error"): void;
-  setStatus(key: string, text: string | undefined): void;
-}
-
-export interface ExtensionContextLike {
-  ui: ExtensionUiLike;
-  model?: ModelLike;
-}
-
-export interface ExtensionApiLike {
-  registerProvider(
-    name: string,
-    config: {
-      api: string;
-      apiKey: string;
-      streamSimple: StreamSimpleLike;
-    },
-  ): void;
-  registerCommand(
-    name: string,
-    options: {
-      description: string;
-      handler: (args: string, ctx: ExtensionContextLike) => Promise<void> | void;
-    },
-  ): void;
-  on(
-    event: "session_start" | "model_select" | "session_shutdown",
-    handler: (event: unknown, ctx: ExtensionContextLike) => Promise<void> | void,
-  ): void;
-}
-
-export interface Clock {
-  now(): number;
 }
