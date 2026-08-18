@@ -1,0 +1,20 @@
+{
+  "provider": "my-company-ai",
+  "api": "openai-completions",
+  "keys": [
+    { "id": "key-1", "value": "REPLACE_WITH_API_KEY_1" },
+    { "id": "key-2", "value": "REPLACE_WITH_API_KEY_2" },
+    { "id": "key-3", "value": "REPLACE_WITH_API_KEY_3" }
+  ],
+  "requestsPerKey": 20,
+  "maxAttemptsPerRequest": 3,
+  "cooldownMs": 60000,
+  "transientCooldownMs": 5000,
+  "maxRetryAfterMs": 900000,
+  "retryStatuses": [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504],
+  "disableStatuses": [401, 402, 403],
+  "cooldownStatuses": [429],
+  "retryNetworkErrors": true,
+  "lockTimeoutMs": 5000,
+  "staleLockMs": 30000
+}
