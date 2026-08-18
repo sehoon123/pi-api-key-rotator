@@ -17,7 +17,7 @@ function registerDisabledCommand(pi: ExtensionAPI, message: string): void {
   console.warn(`[pi-api-key-rotator] ${message}`);
   pi.registerCommand("key-rotator", {
     description: "Explain why the API key rotator is disabled",
-    handler: (_args, ctx) => {
+    handler: async (_args, ctx) => {
       ctx.ui.notify(message, "error");
     },
   });
