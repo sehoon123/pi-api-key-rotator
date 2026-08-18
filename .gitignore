@@ -3,9 +3,21 @@ coverage/
 dist/
 *.log
 *.tmp
+
+# Local credentials and per-machine configuration
 .env
+.env.*
+!.env.example
 key-rotator.json
+**/key-rotator.json
+key-rotator.local.json
+**/key-rotator.local.json
+config.literal.local.json
+**/config.literal.local.json
+
+# Runtime state
 *.state.json
 *.state.json.lock
+
 .DS_Store
 Thumbs.db
