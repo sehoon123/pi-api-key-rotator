@@ -1,15 +1,16 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { ConfigNotFoundError, loadConfig } from "./config.ts";
-import { registerKeyRotatorExtension } from "./extension.ts";
+import { ConfigNotFoundError } from "./config.ts";
+import { loadConfigSet } from "./config-set.ts";
+import type { RotatorConfigSet } from "./config-set.ts";
+import { registerMultiPoolKeyRotatorExtension } from "./multi-pool-extension.ts";
 import { createInitialPoolState, KeyPool } from "./key-pool.ts";
 import { JsonFileStateStore } from "./state-store.ts";
 import type {
   EventStreamFactory,
   ExtensionApiLike,
   PoolState,
-  RotatorConfig,
   StreamSimpleLike,
 } from "./types.ts";
 
@@ -30,29 +31,30 @@ function registerDisabledCommand(pi: ExtensionAPI, message: string): void {
 }
 
 export default async function apiKeyRotatorExtension(pi: ExtensionAPI): Promise<void> {
-  let config: RotatorConfig;
+  let configSet: RotatorConfigSet;
   try {
-    config = await loadConfig();
+    configSet = await loadConfigSet();
   } catch (error) {
     const message =
       error instanceof ConfigNotFoundError
-        ? `Configuration is missing at ${error.configFile}. Copy an example config there, add at least two API keys, and run /reload.`
+        ? `Configuration is missing at ${error.configFile}. Copy an example config there, add at least one pool with two API keys, and run /reload.`
         : `Extension is disabled because configuration loading failed: ${error instanceof Error ? error.message : String(error)}`;
     registerDisabledCommand(pi, message);
     return;
   }
 
-  const store = new JsonFileStateStore<PoolState>({
-    stateFile: config.stateFile,
-    initialState: () => createInitialPoolState(config, Date.now()),
-    lockTimeoutMs: config.lockTimeoutMs,
-    staleLockMs: config.staleLockMs,
+  const pools = configSet.pools.map((config) => {
+    const store = new JsonFileStateStore<PoolState>({
+      stateFile: config.stateFile,
+      initialState: () => createInitialPoolState(config, Date.now()),
+      lockTimeoutMs: config.lockTimeoutMs,
+      staleLockMs: config.staleLockMs,
+    });
+    return { config, pool: new KeyPool(config, store) };
   });
-  const pool = new KeyPool(config, store);
 
-  registerKeyRotatorExtension(pi as unknown as ExtensionApiLike, {
-    config,
-    pool,
+  registerMultiPoolKeyRotatorExtension(pi as unknown as ExtensionApiLike, {
+    pools,
     baseStreamSimple: streamSimple as unknown as StreamSimpleLike,
     createEventStream: createAssistantMessageEventStream as unknown as EventStreamFactory,
   });
