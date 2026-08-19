@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ConfigValidationError } from "../src/config.ts";
 import { resolveConfigSet } from "../src/config-set.ts";
+import type { RawMultiPoolConfig } from "../src/config-set.ts";
 import { registerMultiPoolKeyRotatorExtension } from "../src/multi-pool-extension.ts";
 import { createInitialPoolState, KeyPool } from "../src/key-pool.ts";
 import { InMemoryStateStore } from "../src/state-store.ts";
@@ -20,7 +21,7 @@ const RESOLVE_OPTIONS = {
   env: {},
 };
 
-function rawPools() {
+function rawPools(): RawMultiPoolConfig {
   return {
     pools: [
       {
