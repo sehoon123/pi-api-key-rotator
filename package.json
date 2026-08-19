@@ -1,7 +1,7 @@
 {
   "name": "pi-api-key-rotator",
-  "version": "0.2.0",
-  "description": "A Pi extension that safely rotates one shared API-key pool across multiple provider/API targets.",
+  "version": "0.3.0",
+  "description": "A Pi extension that runs independent API-key rotation pools for multiple provider endpoints.",
   "type": "module",
   "license": "MIT",
   "author": "SH Jung",
@@ -20,6 +20,7 @@
     "api-key",
     "rotation",
     "multi-provider",
+    "multi-endpoint",
     "rate-limit",
     "failover"
   ],
@@ -34,10 +35,12 @@
   "files": [
     "src",
     "README.md",
+    "MULTI_POOL.md",
     "LICENSE",
     "config.example.json",
     "config.literal.example.json",
-    "config.ibm-ica.example.json"
+    "config.ibm-ica.example.json",
+    "config.multi-pool.example.json"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",

@@ -1,0 +1,35 @@
+{
+  "pools": [
+    {
+      "poolId": "ibm-ica-primary",
+      "targets": [
+        {
+          "provider": "ibm-ica-claude",
+          "api": "anthropic-messages"
+        },
+        {
+          "provider": "ibm-ica",
+          "api": "openai-completions"
+        }
+      ],
+      "keys": [
+        { "id": "primary-key-1", "value": "REPLACE_WITH_PRIMARY_API_KEY_1" },
+        { "id": "primary-key-2", "value": "REPLACE_WITH_PRIMARY_API_KEY_2" },
+        { "id": "primary-key-3", "value": "REPLACE_WITH_PRIMARY_API_KEY_3" }
+      ],
+      "requestsPerKey": 20,
+      "maxAttemptsPerRequest": 3
+    },
+    {
+      "poolId": "ibm-ica-secondary",
+      "provider": "ibm-ica-secondary",
+      "api": "openai-completions",
+      "keys": [
+        { "id": "secondary-key-1", "value": "REPLACE_WITH_SECONDARY_API_KEY_1" },
+        { "id": "secondary-key-2", "value": "REPLACE_WITH_SECONDARY_API_KEY_2" }
+      ],
+      "requestsPerKey": 10,
+      "maxAttemptsPerRequest": 2
+    }
+  ]
+}
