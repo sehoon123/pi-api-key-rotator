@@ -14,7 +14,7 @@ import type {
   PoolSnapshot,
   StreamSimpleLike,
 } from "../src/types.ts";
-import { makeConfig, mutableClock, TestEventStream } from "./helpers.ts";
+import { collect, makeConfig, mutableClock, TestEventStream } from "./helpers.ts";
 
 class MockPi implements ExtensionApiLike {
   provider:
@@ -233,7 +233,7 @@ test("status formatting includes operational data but not environment values", (
   assert.doesNotMatch(detailed, /VERY_SECRET_ENV/);
 });
 
-test("the per-provider guard passes mismatched provider and API calls through unchanged", async () => {
+test("the per-provider guard denies mismatched provider and API calls", async () => {
   const time = mutableClock(1_000);
   const config = makeConfig();
   const pool = new KeyPool(
@@ -257,20 +257,24 @@ test("the per-provider guard passes mismatched provider and API calls through un
 
   const registered = pi.provider?.config.streamSimple;
   assert.ok(registered);
-  registered(
-    { provider: "other-provider", api: "openai-completions", id: "wrong-provider" },
-    {},
-    { apiKey: "caller-key" },
-  );
-  registered(
-    { provider: "test-provider", api: "anthropic-messages", id: "wrong-api" },
-    {},
-    { apiKey: "caller-key" },
-  );
-
-  assert.deepEqual(calls, [
-    { provider: "other-provider", api: "openai-completions", apiKey: "caller-key" },
-    { provider: "test-provider", api: "anthropic-messages", apiKey: "caller-key" },
+  const events = await Promise.all([
+    collect(
+      registered(
+        { provider: "other-provider", api: "openai-completions", id: "wrong-provider" },
+        {},
+        { apiKey: "caller-key" },
+      ),
+    ),
+    collect(
+      registered(
+        { provider: "test-provider", api: "anthropic-messages", id: "wrong-api" },
+        {},
+        { apiKey: "caller-key" },
+      ),
+    ),
   ]);
+
+  assert.deepEqual(calls, []);
+  assert.deepEqual(events.map((entry) => entry.map((event) => event.type)), [["error"], ["error"]]);
   assert.equal((await pool.snapshot()).totalAttempts, 0);
 });

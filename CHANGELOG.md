@@ -52,9 +52,9 @@ All notable release-facing changes are documented here.
 - `rateLimitScope: "key" | "target" | "pool"`, default `"key"`, for `cooldownStatuses`.
 - `targetFailureThreshold`, default `2`, with per-target consecutive-failure, cooldown, status,
   timestamp, and ordered-outcome state.
-- `/key-rotator doctor`, which sends no provider request and reports local config/state safety plus
-  the provider/api pairs submitted by this extension. It does not confirm Pi's final composed
-  provider or detect a later competing registration.
+- `/key-rotator doctor`, which sends no provider request and reports config/state/lock safety plus
+  public Pi post-bind registration evidence. Exact retained evidence is `OK`; unavailable inspection
+  is `WARN`; disabled, missing, changed, native, lookup-error, or replacement evidence is `FAIL`.
 - `maxStateFileBytes` dynamic minimum sized for a worst-case state v2 object and rolling-config
   overlap.
 - Physical path collision detection across config, state, `.lock`, `.lock.reclaim`, and `.bak`,
@@ -108,11 +108,20 @@ All notable release-facing changes are documented here.
 - Provider status classification uses supported structured data and narrowly anchored api-specific
   fallbacks. Arbitrary numeric error text is not parsed as status.
 - Pi 0.84.2 agent-level retry is a separate budget. This package assumes no private host lifecycle marker. Set Pi `retry.enabled` to `false` when a strict whole-turn ceiling is required.
-- Provider registration is Pi provider-scoped. A managed provider/api mismatch is a failure because
-  Pi can otherwise bypass the wrapper.
-- Pi 0.84.2 may merge a later registration for the same provider instead of rejecting it. The real-host
-  security contract therefore covers both API mismatch and competing-registration paths with stored
-  `auth.json` credentials; local doctor output alone does not establish the winning stream.
+- Provider registration remains Pi provider-scoped. The managed request fence checks API match and
+  public registration evidence at `input`, every `turn_start`, and both provider-request hooks. It
+  synchronously aborts blocked requests before dispatch and cancels compaction/tree summaries.
+- Pi 0.84.2 may merge a later registration for the same provider instead of rejecting it. The fence
+  requires the exact API, inert key, guarded stream function, safe field set, no native provider, and
+  captured registration-object identity. A request-boundary violation latches until reload; doctor
+  reads evidence without changing the latch. Disabled pools keep their
+  targets fenced even though registration is omitted.
+- The real-host contract covers API mismatch and competing-registration paths with stored `auth.json`
+  credentials; both make zero physical requests and consume zero pool attempts. Header deletion is
+  defense in depth because query-string authentication requires aborting before dispatch.
+- These guarantees cover Pi's `AgentSession` lifecycle pipeline. Direct
+  `ctx.modelRegistry.complete()`/`fetch` calls, ignored cancellation, and malicious trusted code that
+  bypasses Pi hooks are out of scope.
 
 ### Lock, backup, and crash behavior
 
@@ -201,10 +210,10 @@ fresh state. This intentionally loses counters, circuits, cooldowns, and disable
 
 #### 5. Verify
 
-Run `/reload`, `/key-rotator doctor`, and `/key-rotator status`. Doctor reports only local checks; it
-does not confirm the final host provider composition. Inspect Pi startup diagnostics, remove duplicate
-registrations, and make one controlled provider request only after doctor no longer reports a
-state/path failure.
+Run `/reload`, `/key-rotator doctor`, and `/key-rotator status`. On Pi 0.84.2 doctor checks public
+post-bind provider evidence but does not call a provider or sandbox trusted extensions. Inspect Pi
+startup diagnostics, remove duplicate registrations, and make one controlled provider request only
+after doctor no longer reports a state/path/registration failure.
 
 ## [0.3.0] - 2026-08-19
 

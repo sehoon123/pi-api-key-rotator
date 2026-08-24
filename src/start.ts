@@ -107,17 +107,16 @@ export async function startKeyRotator(pi: ExtensionApiLike, options: StartOption
     return "disabled";
   }
 
-  let registeredTargets = new Map<string, string>();
   try {
     await registerMultiPoolKeyRotatorExtension(pi, {
       pools,
       baseStreamSimple: options.baseStreamSimple,
       createEventStream: options.createEventStream,
-      doctor: async () =>
+      doctor: async (registrations) =>
         buildDoctorReport({
           configFile: configSet.configFile,
           pools: configSet.pools,
-          registeredTargets,
+          registrationEvidence: registrations,
           stateReaders: new Map(
             pools.map((runtime) => [
               runtime.config.poolId ?? runtime.config.provider,
@@ -125,9 +124,6 @@ export async function startKeyRotator(pi: ExtensionApiLike, options: StartOption
             ]),
           ),
         }),
-      onRegistered: (registered) => {
-        registeredTargets = new Map(registered);
-      },
     });
   } catch (error) {
     registerDisabledCommand(

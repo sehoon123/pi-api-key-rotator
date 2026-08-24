@@ -190,8 +190,11 @@ test("active startup injects Pi streams, registers inert auth, and exposes local
     assert.equal(pi.providers.get("startup-provider")?.apiKey, MANAGED_KEY_PLACEHOLDER);
     const ui = makeUi();
     await pi.commands.get("key-rotator")!.handler("doctor", ui.ctx);
-    assert.equal(ui.notifications.at(-1)?.type, process.platform === "win32" ? "warning" : "info");
-    assert.match(ui.notifications.at(-1)?.message ?? "", /openai-completions registered locally/);
+    assert.equal(ui.notifications.at(-1)?.type, "warning");
+    assert.match(
+      ui.notifications.at(-1)?.message ?? "",
+      /local submission uses openai-completions, but this Pi version exposes no post-bind acknowledgement/,
+    );
     assert.match(ui.notifications.at(-1)?.message ?? "", /no provider requests sent/);
     assert.equal(providerCalls, 0);
   } finally {

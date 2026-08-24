@@ -314,6 +314,16 @@ export interface ExtensionUiLike {
 export interface ExtensionContextLike {
   ui: ExtensionUiLike;
   model?: ModelLike;
+  modelRegistry?: {
+    getRegisteredProviderConfig?(provider: string): {
+      api?: unknown;
+      apiKey?: unknown;
+      streamSimple?: unknown;
+      [key: string]: unknown;
+    } | undefined;
+    getRegisteredNativeProvider?(provider: string): unknown;
+  };
+  abort?: () => void;
 }
 
 export interface ExtensionApiLike {
@@ -333,8 +343,17 @@ export interface ExtensionApiLike {
     },
   ): void;
   on(
-    event: "session_start" | "model_select" | "session_shutdown",
-    handler: (event: unknown, ctx: ExtensionContextLike) => Promise<void> | void,
+    event:
+      | "session_start"
+      | "model_select"
+      | "session_shutdown"
+      | "input"
+      | "turn_start"
+      | "before_provider_headers"
+      | "before_provider_request"
+      | "session_before_compact"
+      | "session_before_tree",
+    handler: (event: unknown, ctx: ExtensionContextLike) => unknown | Promise<unknown>,
   ): void;
 }
 

@@ -32,6 +32,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - atomic replacement, 이전 state version backup, cross-process hard-link lock을 사용합니다.
 - corrupt, wrong-pool, oversized, unsafe state를 조용히 초기화하지 않고 거부합니다.
 - command-backed secret source와 read-only `/key-rotator doctor`를 제공합니다.
+- 선택된 API, Pi에 유지된 provider registration, pool preflight가 rotator contract와 다르면 managed
+  request를 거부합니다.
 
 ## 2. 요구 사항과 호환성
 
@@ -40,7 +42,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - pool마다 독립적으로 사용할 수 있는 API key 2개 이상.
 - 각 provider가 `<agent dir>/models.json`에 이미 있어야 하며 `api` 값이 이 config와 정확히 같아야 합니다.
   `<agent dir>`은 `PI_CODING_AGENT_DIR`가 설정되어 있으면 그 값이고, 아니면 `~/.pi/agent`입니다.
-  api mismatch에서는 Pi가 extension stream을 bypass할 수 있습니다.
+  API mismatch에서는 Pi가 provider-scoped extension stream을 bypass할 수 있으므로 v0.4.0은 provider
+  dispatch 전에 해당 managed request도 abort합니다.
 - state directory의 filesystem이 atomic hard link를 지원해야 합니다.
 
 Pi의 provider composition, adapter event, retry classification은 version별 contract입니다. 다른 Pi version을
@@ -283,19 +286,26 @@ Pi 0.84.2는 최종 provider-like error를 별도로 agent-level retry할 수 �
 | `/key-rotator` | `status`와 동일. |
 | `/key-rotator status [poolId]` | 모든 pool 또는 한 pool의 전체 상태. |
 | `/key-rotator list` | pool마다 한 줄 요약. |
-| `/key-rotator doctor` | read-only local config/state/provider-api 점검. provider 요청 없음. |
+| `/key-rotator doctor` | read-only config/state/lock/post-bind registration 점검. provider 요청 없음. |
 | `/key-rotator next <poolId\|all>` | current key를 다음으로 이동. |
 | `/key-rotator reset <poolId\|all>` | health/counter를 지우고 state generation 증가. |
 
 pool이 여러 개이면 인자 없는 `next`/`reset`은 선택된 model의 pool을 추론할 수 있을 때 그 pool에 적용합니다.
 추론할 수 없으면 거부하고 pool id 또는 `all`을 요구합니다.
 
-`doctor`는 config metadata, state size/ownership/mode/readability, parent writability, strict read-only state
-parse, 그리고 이 extension이 local registration에 제출한 provider/api pair를 확인하여 `OK`, `WARN`, `FAIL`을
-보고합니다. Pi가 최종 compose한 provider를 검사하거나, 나중 또는 duplicate registration을 발견하거나, host가
-rotator stream을 호출할 것을 증명하지는 않습니다. 또한 provider를 호출하거나 credential/quota를 검증하지
-않으며 Windows ACL, 모든 adapter failure shape, mutation 없는 hard-link 지원을 증명하지 않습니다. config
-load 자체가 실패하면 disabled `/key-rotator`가 load error를 표시하며 full doctor는 아직 사용할 수 없습니다.
+`doctor`는 config metadata, 기존 state의 size/ownership/mode/readability, fixed lock sidecar, strict
+read-only state parse, Pi의 public post-bind provider-registration evidence를 확인합니다. Pi 0.84.2에서는 정확한
+configured API, inert `rotator-managed-key`, rotator stream function, 안전한 field set, native provider 부재,
+그리고 capture한 registration-object identity를 요구합니다. request boundary에서 missing, changed, native,
+unreadable registration을 관찰하면 `/reload` 전까지 `FAIL`로 유지합니다. doctor 실행 자체는 request state를
+capture하거나 latch하지 않습니다. 두 public lookup method가 없는 Pi version에서는 local
+submission을 acceptance로 간주하지 않고 `WARN`을 보고합니다.
+
+Doctor는 `OK`, `WARN`, `FAIL`을 보고하며 provider request를 보내지 않습니다. credential/quota를 검증하지
+않고 Windows ACL, 모든 adapter failure shape, mutation 없는 hard-link 지원을 증명하지 않습니다. 또한 Pi
+hook을 bypass하거나 `AbortSignal`을 무시하거나 직접 `fetch`/registry API를 호출하는 malicious trusted
+extension/provider를 통제할 수 없습니다. config load 자체가 실패하면 disabled `/key-rotator`가 load error를
+표시하며 full doctor는 아직 사용할 수 없습니다.
 
 ## 10. State v2, lock, fail-closed 동작
 
@@ -411,8 +421,9 @@ upstream log를 보호하고 credential을 다룰 때 provider debug logging을 
 | 증상 | 원인과 해결 |
 |---|---|
 | footer가 `keys: disabled` | local config 또는 startup 실패. `/key-rotator`에서 기록된 load error 확인. |
-| duplicate extension/provider registration | Pi 0.84.2는 later registration을 거부하지 않고 merge할 수 있음. duplicate copy를 제거하고 `doctor`를 winning stream의 증명으로 보지 말 것. |
-| managed provider가 rotation 없이 fallback 전송 | selected model api와 target api가 다르거나 다른 registration이 이김. 즉시 provider/api contract 수정. |
+| duplicate extension/provider registration | competing registration을 관찰하면 request fence와 doctor가 실패함. duplicate copy를 제거하고 `/reload` 실행. |
+| managed request가 dispatch 전에 거부됨 | selected model API mismatch, pool preflight 실패, 또는 Pi가 정확한 rotator registration을 유지하지 않음. 원인을 수정하고 `/reload` 실행. |
+| managed provider가 rotation 없이 fallback 전송 | 즉시 중단. trusted component가 검증된 Pi 0.84.2 extension pipeline을 bypass했거나 cancellation을 무시함. |
 | `No rotation entry is currently available (...)` | key, target, pool scope 중 하나가 unavailable. status 확인. |
 | `Credential failover exhausted N attempt(s)` | wrapper budget 소진 또는 target/pool circuit 중단. Pi outer retry는 별도일 수 있음. |
 | state corruption/security/size error | fail closed 상태. reset이 아니라 복구 절차 사용. |
@@ -424,9 +435,17 @@ upstream log를 보호하고 credential을 다룰 때 provider debug logging을 
 
 ## 14. Pi 연동 방식
 
-Pi 0.84.2는 extension `streamSimple`을 registered provider마다 compose하고 selected model api와 registration
-api가 같을 때만 호출합니다. package는 configured target마다 inert fallback `rotator-managed-key`를
-등록하고 각 attempt에 선택한 실제 key를 inject합니다. global per-api dispatcher는 설치하지 않습니다.
+Pi 0.84.2는 extension `streamSimple`을 registered provider마다 compose하고 selected model API와
+registration API가 같을 때만 호출합니다. package는 configured target마다 inert fallback
+`rotator-managed-key`를 등록하고 각 attempt에 선택한 실제 key를 inject합니다. 또한 `input`, 모든
+`turn_start`, 두 provider-request hook에서 public provider registration과 model API를 다시 확인합니다. blocked
+request는 dispatch 전에 동기적으로 abort하며 authentication header 삭제는 defense in depth일 뿐입니다.
+selected managed target이 blocked 상태이면 compaction/tree summary generation도 cancel합니다.
+
+검증된 fence 범위는 Pi의 `AgentSession` lifecycle pipeline입니다. trusted extension이
+`ctx.modelRegistry.complete()`를 직접 호출하면 lifecycle hook을 bypass합니다. `fetch` 또는 registry를 직접
+호출하거나 cancellation을 무시하는 code도 범위 밖입니다. global per-API dispatcher를 설치하거나 native
+provider를 takeover하지 않습니다.
 
 base attempt stream은 `@earendil-works/pi-ai/compat`의 `streamSimple`입니다. auth-like header 안의 raw,
 URL-encoded, base64, base64url credential 형태도 선택한 key 형태로 교체합니다. failure event와 outer retry는

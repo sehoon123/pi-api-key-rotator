@@ -1,5 +1,13 @@
-import { compactStatus, fallbackApiKey, formatStatus, STATUS_KEY } from "./extension.ts";
+import {
+  compactStatus,
+  fallbackApiKey,
+  formatStatus,
+  MANAGED_KEY_PLACEHOLDER,
+  STATUS_KEY,
+} from "./extension.ts";
 import type { KeyPool } from "./key-pool.ts";
+import { installManagedRequestFence } from "./request-fence.ts";
+import type { ManagedRequestTarget, RegistrationEvidence } from "./request-fence.ts";
 import { createRotatingStream } from "./rotating-stream.ts";
 import type {
   EventStreamFactory,
@@ -21,10 +29,12 @@ export interface RegisterMultiPoolDependencies {
   pools: PoolRuntime[];
   baseStreamSimple: StreamSimpleLike;
   createEventStream: EventStreamFactory;
-  /** Called after every direct Pi provider registration succeeds. */
+  /** Called after healthy provider registrations are queued locally. */
   onRegistered?: (targets: ReadonlyMap<string, string>) => void;
   /** Local-only operational report. It must not make provider requests. */
-  doctor?: () => Promise<{ text: string; severity: "OK" | "WARN" | "FAIL" }>;
+  doctor?: (
+    registrations: ReadonlyMap<string, RegistrationEvidence>,
+  ) => Promise<{ text: string; severity: "OK" | "WARN" | "FAIL" }>;
 }
 
 interface RegisteredPool extends PoolRuntime {
@@ -366,6 +376,19 @@ export async function registerMultiPoolKeyRotatorExtension(
     });
   };
 
+  const managedTargets = new Map<string, ManagedRequestTarget>();
+  for (const runtime of pools) {
+    for (const target of runtime.targets) {
+      managedTargets.set(target.provider, {
+        provider: target.provider,
+        api: target.api,
+        apiKey: MANAGED_KEY_PLACEHOLDER,
+        poolId: runtime.id,
+        ...(!isEnabled(runtime) ? { disabledReason: "state preflight failed" } : {}),
+      });
+    }
+  }
+
   const registeredTargets = new Map<string, string>();
   for (const runtime of enabledPools) {
     const firstKey = runtime.config.keys[0];
@@ -374,14 +397,14 @@ export async function registerMultiPoolKeyRotatorExtension(
 
     for (const target of runtime.targets) {
       // Pi keeps streamSimple per provider. Retain direct target-specific
-      // registrations and pass the original Pi model through unchanged.
+      // registrations and pass the original Pi model through unchanged. A
+      // direct mismatch enters createRotatingStream's fail-closed guard; it
+      // never falls through to a host credential.
       const guardedStream = ((model, context, options) => {
-        if (model.provider !== target.provider || model.api !== target.api) {
-          return dependencies.baseStreamSimple(model, context, options);
-        }
-
         const selected = selection;
         const requestOwner =
+          model.provider === target.provider &&
+          model.api === target.api &&
           selected.kind === "active" &&
           selected.runtime === runtime &&
           selected.target.provider === target.provider &&
@@ -407,10 +430,18 @@ export async function registerMultiPoolKeyRotatorExtension(
         apiKey: providerFallback,
         streamSimple: guardedStream,
       });
+      managedTargets.set(target.provider, {
+        provider: target.provider,
+        api: target.api,
+        apiKey: providerFallback,
+        poolId: runtime.id,
+        streamSimple: guardedStream,
+      });
       registeredTargets.set(target.provider, target.api);
     }
   }
   dependencies.onRegistered?.(new Map(registeredTargets));
+  const requestFence = installManagedRequestFence(pi, managedTargets);
 
   type PoolRead =
     | { runtime: PreparedPool; text: string }
@@ -537,7 +568,7 @@ export async function registerMultiPoolKeyRotatorExtension(
             return;
           }
           const footerOrder = reserveFooter();
-          const report = await dependencies.doctor();
+          const report = await dependencies.doctor(requestFence.registrations(ctx));
           if (!stillOwns(token)) return;
           token.owner.ui.notify(
             report.text,

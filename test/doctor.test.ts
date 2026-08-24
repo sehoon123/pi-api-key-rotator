@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { buildDoctorReport } from "../src/doctor.ts";
+import type { RegistrationEvidence } from "../src/request-fence.ts";
 import { createInitialPoolState, KeyPool } from "../src/key-pool.ts";
 import { JsonFileStateStore } from "../src/state-store.ts";
 import type { PoolState } from "../src/types.ts";
@@ -25,7 +26,10 @@ async function fixture() {
   });
   const pool = new KeyPool(config, store);
   const registeredTargets = new Map([[config.provider, config.api]]);
-  return { directory, config, configFile, stateFile, pool, registeredTargets };
+  const registrationEvidence = new Map<string, RegistrationEvidence>([
+    [config.provider, { status: "verified", api: config.api }],
+  ]);
+  return { directory, config, configFile, stateFile, pool, registeredTargets, registrationEvidence };
 }
 
 async function mutationSnapshot(directory: string, paths: readonly string[]) {
@@ -69,7 +73,7 @@ test("doctor reports runtime corruption and a mismatched local registration as F
 
     assert.equal(report.severity, "FAIL");
     assert.match(report.text, /read-only state validation failed \(StateCorruptionError\)/);
-    assert.match(report.text, /registered for anthropic-messages, expected openai-completions/);
+    assert.match(report.text, /local submission used anthropic-messages, expected openai-completions/);
     assert.doesNotMatch(report.text, /another-pool/);
     assert.match(report.text, /local checks only; no provider requests sent/);
   } finally {
@@ -91,7 +95,7 @@ test(
       const report = await buildDoctorReport({
         configFile: item.configFile,
         pools: [item.config],
-        registeredTargets: item.registeredTargets,
+        registrationEvidence: item.registrationEvidence,
       });
       assert.equal(report.severity, "FAIL");
       assert.match(report.text, /\[WARN\] Config/);
@@ -104,17 +108,17 @@ test(
   },
 );
 
-test("doctor returns OK for a secure config and creatable state without creating it", async () => {
+test("doctor returns OK for a secure config and absent state without creating it", async () => {
   const item = await fixture();
   try {
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [item.config],
-      registeredTargets: item.registeredTargets,
+      registrationEvidence: item.registrationEvidence,
       stateReaders: new Map([["doctor-pool", () => item.pool.snapshot()]]),
     });
     assert.equal(report.severity, process.platform === "win32" ? "WARN" : "OK");
-    assert.match(report.text, /openai-completions registered locally/);
+    assert.match(report.text, /Pi retained the exact key-rotator stream for openai-completions/);
     await assert.rejects(lstat(item.stateFile), (error: unknown) => {
       return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
     });
@@ -123,21 +127,59 @@ test("doctor returns OK for a secure config and creatable state without creating
   }
 });
 
-test("doctor fails when a configured provider was not captured after registration", async () => {
+test("doctor fails when post-bind evidence reports a missing provider registration", async () => {
   const item = await fixture();
   try {
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [item.config],
-      registeredTargets: new Map(),
+      registrationEvidence: new Map([
+        [item.config.provider, { status: "missing" as const, api: item.config.api }],
+      ]),
     });
     assert.equal(report.severity, "FAIL");
-    assert.match(report.text, /provider was not registered for openai-completions/);
+    assert.match(report.text, /Pi did not retain a provider registration for openai-completions/);
   } finally {
     await rm(item.directory, { recursive: true, force: true });
   }
 });
 
+
+test("doctor describes a same-API stream overwrite without a contradictory API mismatch", async () => {
+  const item = await fixture();
+  try {
+    const report = await buildDoctorReport({
+      configFile: item.configFile,
+      pools: [item.config],
+      registrationEvidence: new Map([
+        [item.config.provider, { status: "overwritten" as const, api: item.config.api }],
+      ]),
+    });
+    assert.equal(report.severity, "FAIL");
+    assert.match(report.text, /another registration replaced the expected openai-completions stream/);
+    assert.doesNotMatch(
+      report.text,
+      /registered for openai-completions, expected openai-completions/,
+    );
+  } finally {
+    await rm(item.directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor treats a local submission without host acknowledgement as WARN", async () => {
+  const item = await fixture();
+  try {
+    const report = await buildDoctorReport({
+      configFile: item.configFile,
+      pools: [item.config],
+      registeredTargets: item.registeredTargets,
+    });
+    assert.equal(report.severity, "WARN");
+    assert.match(report.text, /submitted locally, but Pi acceptance was not verified/);
+  } finally {
+    await rm(item.directory, { recursive: true, force: true });
+  }
+});
 
 test("missing state under a missing parent is OK and doctor creates nothing", async () => {
   const item = await fixture();
@@ -154,7 +196,9 @@ test("missing state under a missing parent is OK and doctor creates nothing", as
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [config],
-      registeredTargets: new Map([[config.provider, config.api]]),
+      registrationEvidence: new Map([
+        [config.provider, { status: "verified" as const, api: config.api }],
+      ]),
       stateReaders: new Map([
         [
           "missing-state",
@@ -202,7 +246,9 @@ test(
       const report = await buildDoctorReport({
         configFile: item.configFile,
         pools: [config],
-        registeredTargets: new Map([[config.provider, config.api]]),
+        registrationEvidence: new Map([
+        [config.provider, { status: "verified" as const, api: config.api }],
+      ]),
       });
       const after = await mutationSnapshot(realDirectory, [realState]);
 
@@ -235,7 +281,7 @@ test("doctor reports a valid live lock without mutating its file or directory", 
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [item.config],
-      registeredTargets: item.registeredTargets,
+      registrationEvidence: item.registrationEvidence,
     });
     const after = await mutationSnapshot(item.directory, [item.configFile, lockFile]);
 
@@ -270,7 +316,7 @@ test("doctor reports a stale dead-owner lock as reclaimable without reclaiming i
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [item.config],
-      registeredTargets: item.registeredTargets,
+      registrationEvidence: item.registrationEvidence,
     });
     const after = await mutationSnapshot(item.directory, [item.configFile, lockFile]);
 
@@ -302,7 +348,7 @@ test("doctor fails on fixed reclaim evidence and leaves both hard links unchange
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [item.config],
-      registeredTargets: item.registeredTargets,
+      registrationEvidence: item.registrationEvidence,
     });
     const after = await mutationSnapshot(item.directory, [item.configFile, lockFile, reclaimFile]);
 
@@ -323,7 +369,7 @@ test("doctor fails closed on malformed lock metadata without rewriting it", asyn
     const report = await buildDoctorReport({
       configFile: item.configFile,
       pools: [item.config],
-      registeredTargets: item.registeredTargets,
+      registrationEvidence: item.registrationEvidence,
     });
     const after = await mutationSnapshot(item.directory, [item.configFile, lockFile]);
 

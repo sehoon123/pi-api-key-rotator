@@ -87,13 +87,17 @@ test("quick start uses a reachable pinned example and documents real path/enviro
   assert.doesNotMatch((await Promise.all(auditedPaths.map(text))).join("\n"), /explicit loader (?:option|path)/u);
 });
 
-test("doctor and duplicate-registration claims stay within what Pi 0.84.2 proves", async () => {
+test("request-fence and doctor claims stay within what Pi 0.84.2 proves", async () => {
   const english = await text("README.md");
   const internals = await text("docs/PI_INTERNALS.md");
   const changelog = await text("CHANGELOG.md");
-  assert.match(english, /does not inspect Pi's final composed provider/u);
-  assert.match(english, /may merge a later registration instead of rejecting it/u);
-  assert.match(internals, /does not definitively reject duplicate provider registrations/u);
-  assert.match(internals, /does not query Pi's final composed provider/u);
-  assert.match(changelog, /does not confirm Pi's final composed\s+provider/u);
+  const security = await text("SECURITY.md");
+  assert.match(english, /public post-bind provider-registration evidence/u);
+  assert.match(english, /A Pi\s+version without both public lookup methods reports `WARN`/u);
+  assert.match(english, /cannot contain a malicious trusted extension or provider/u);
+  assert.match(internals, /does\s+not definitively reject duplicate provider registrations/u);
+  assert.match(internals, /getRegisteredProviderConfig\(\).*getRegisteredNativeProvider\(\)/su);
+  assert.match(internals, /no physical request and consumes no pool attempt/u);
+  assert.match(changelog, /A request-boundary violation latches until reload/u);
+  assert.match(security, /scoped to Pi's verified `AgentSession` lifecycle pipeline/u);
 });

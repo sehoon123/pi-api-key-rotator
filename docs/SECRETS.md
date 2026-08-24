@@ -20,10 +20,16 @@ the [README quick start](../README.md#5-quick-start), including the
 [environment](../examples/key-rotator.env.example.json) and
 [command](../examples/key-rotator.command.example.json) forms.
 
-The provider registry never receives a configured pool secret. It receives the inert non-empty
-fallback `rotator-managed-key` for every managed provider. The rotating stream replaces the attempt
-`apiKey`. In headers, it also replaces raw, URI-encoded, base64, and base64url forms of the previous
-or any configured pool credential with the same form of the selected credential.
+The provider registry never receives a configured pool secret. Every healthy registered target gets
+the inert non-empty fallback `rotator-managed-key`; a target whose state preflight failed is not
+registered and remains blocked by the managed request fence. The rotating stream replaces the
+attempt `apiKey`. In headers, it also replaces raw, URI-encoded, base64, and base64url forms of the
+previous or any configured pool credential with the same form of the selected credential.
+
+For a model API mismatch or lost/changed registration, the Pi 0.84.2 fence synchronously aborts before
+provider dispatch. Deleting auth-like headers is only defense in depth because credentials can appear
+in a query string. This protects Pi-compliant pipelines, not trusted code that calls the network or
+registry directly or ignores cancellation.
 
 ## 2. Command contract
 

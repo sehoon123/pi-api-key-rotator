@@ -425,25 +425,24 @@ test("DefaultResourceLoader binds the packed rotator and matching API requests u
   assert.equal(await poolAttempts(harness.stateFile), 1);
 });
 
-test("an API mismatch cannot send stored auth and consumes zero pool attempts", async (t) => {
+test("an API mismatch makes zero physical requests and consumes zero pool attempts", async (t) => {
   const harness = await createHostHarness(t, { selectedModel: "api-mismatch-model" });
   const model = harness.runtime.getModel(HOST_PROVIDER, "api-mismatch-model");
   assert.ok(model);
   assert.notEqual(model.api, harness.runtime.getRegisteredProviderConfig(HOST_PROVIDER)?.api);
   assert.equal((await harness.runtime.getAuth(model))?.auth.apiKey, STORED_HOST_CREDENTIAL);
 
-  // A safe fence may refuse before transport or may let an unauthenticated
-  // request reach the local server. Either outcome is acceptable. A stored
-  // credential on any physical request is not.
+  // Aborting before dispatch is the primary fence. Requiring zero physical
+  // calls also covers authentication carried in the URL rather than headers.
   await harness.session.prompt("This mismatched request must fail closed.").catch(() => undefined);
   const observed = {
-    authenticatedPhysicalRequests: harness.requests.filter((request) => request.authHeaderNames.length > 0).length,
+    physicalRequests: harness.requests.length,
     poolAttempts: await poolAttempts(harness.stateFile),
   };
-  assert.deepEqual(observed, { authenticatedPhysicalRequests: 0, poolAttempts: 0 });
+  assert.deepEqual(observed, { physicalRequests: 0, poolAttempts: 0 });
 });
 
-test("a later competing provider registration cannot send stored auth or enter the key pool", async (t) => {
+test("a later competing provider registration makes zero physical requests and pool attempts", async (t) => {
   const harness = await createHostHarness(t, {
     selectedModel: "matching-model",
     competingRegistration: true,
@@ -461,10 +460,10 @@ test("a later competing provider registration cannot send stored auth or enter t
 
   await harness.session.prompt("This competing stream must fail closed.").catch(() => undefined);
   const observed = {
-    authenticatedPhysicalRequests: harness.requests.filter((request) => request.authHeaderNames.length > 0).length,
+    physicalRequests: harness.requests.length,
     poolAttempts: await poolAttempts(harness.stateFile),
   };
-  assert.deepEqual(observed, { authenticatedPhysicalRequests: 0, poolAttempts: 0 });
+  assert.deepEqual(observed, { physicalRequests: 0, poolAttempts: 0 });
 });
 
 async function listen(server: ReturnType<typeof createServer>): Promise<string> {

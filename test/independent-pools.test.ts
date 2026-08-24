@@ -320,7 +320,7 @@ test("commands target one named pool and do not print raw keys", async () => {
   assert.doesNotMatch(notifications.join("\n"), /primary-one|secondary-one/);
 });
 
-test("each direct Pi registration guards both its provider and API", async () => {
+test("each direct Pi registration denies a mismatched provider or API", async () => {
   const { primary, secondary, primaryPool, secondaryPool } = runtimes();
   const calls: Array<{ provider: string; api: string; apiKey: string | undefined }> = [];
   const base: StreamSimpleLike = (selectedModel, _context, options) => {
@@ -355,19 +355,24 @@ test("each direct Pi registration guards both its provider and API", async () =>
   assert.ok(secondaryRegistration);
   assert.notEqual(primaryRegistration.streamSimple, secondaryRegistration.streamSimple);
 
-  await collect(primaryRegistration.streamSimple(model("provider-secondary"), {}, { apiKey: "caller-key" }));
-  await collect(
-    primaryRegistration.streamSimple(
-      { provider: "provider-primary", api: "anthropic-messages", id: "wrong-api" },
-      {},
-      { apiKey: "caller-key" },
+  const mismatchEvents = [
+    await collect(
+      primaryRegistration.streamSimple(model("provider-secondary"), {}, { apiKey: "caller-key" }),
     ),
-  );
+    await collect(
+      primaryRegistration.streamSimple(
+        { provider: "provider-primary", api: "anthropic-messages", id: "wrong-api" },
+        {},
+        { apiKey: "caller-key" },
+      ),
+    ),
+  ];
 
-  assert.deepEqual(calls, [
-    { provider: "provider-secondary", api: "openai-completions", apiKey: "caller-key" },
-    { provider: "provider-primary", api: "anthropic-messages", apiKey: "caller-key" },
-  ]);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(
+    mismatchEvents.map((events) => events.map((event) => event.type)),
+    [["error"], ["error"]],
+  );
   assert.equal((await primaryPool.snapshot()).totalAttempts, 0);
   assert.equal((await secondaryPool.snapshot()).totalAttempts, 0);
 });

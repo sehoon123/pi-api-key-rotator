@@ -32,6 +32,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - Uses atomic replacement, a previous-version backup, and cross-process hard-link locks.
 - Refuses corrupt, wrong-pool, oversized, or unsafe state instead of silently resetting it.
 - Adds command-backed secret sources and `/key-rotator doctor` for read-only local checks.
+- Refuses managed requests when the selected API, retained provider registration, or pool preflight
+  does not match the rotator contract.
 
 ## 2. Requirements and compatibility
 
@@ -40,7 +42,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - **Node.js `>=22.19.0`**.
 - At least two independently usable API keys per pool.
 - Each provider must already exist in `<agent dir>/models.json`. Its `api` must exactly match this
-  config; Pi can bypass the extension stream on an api mismatch.
+  config. Pi can bypass a provider-scoped extension stream on an API mismatch, so v0.4.0 also aborts
+  that managed request before provider dispatch.
 - The state directory must be on a filesystem that supports atomic hard links.
 
 Pi's provider composition, adapter events, and retry classification are version-specific. Review
@@ -288,20 +291,28 @@ attempt limit is required.
 | `/key-rotator` | same as `status` |
 | `/key-rotator status [poolId]` | full status of all pools, or one pool |
 | `/key-rotator list` | one compact line per pool |
-| `/key-rotator doctor` | read-only local config, state, and provider/api checks; sends no request |
+| `/key-rotator doctor` | read-only config, state, lock, and post-bind registration checks; sends no request |
 | `/key-rotator next <poolId\|all>` | advance the current key |
 | `/key-rotator reset <poolId\|all>` | clear health/counters and increment the state generation |
 
 With several pools, a bare `next` or `reset` uses the pool for the selected model when one can be
 inferred. Otherwise it refuses and asks for a pool id or `all`.
 
-`doctor` checks config metadata, state size/ownership/mode/readability, parent writability, strict
-read-only state parsing, and the provider/api pairs that this extension locally submitted for
-registration. It reports `OK`, `WARN`, or `FAIL`. It does not inspect Pi's final composed provider,
-detect a later or duplicate registration, or prove that the host will call the rotator stream. It
-also does not call a provider, validate credentials or quota, inspect Windows ACLs, prove every
-adapter's failure shape, or prove hard-link support without a mutation. If config loading failed, the
-disabled `/key-rotator` command shows that load error; the full doctor is not available yet.
+`doctor` checks config metadata, existing state size/ownership/mode/readability, fixed lock
+sidecars, strict read-only state parsing, and Pi's public post-bind provider-registration evidence.
+On Pi 0.84.2 it requires the exact configured API, inert `rotator-managed-key`, rotator stream
+function, safe field set, no native provider, and the captured registration-object identity. A
+request-boundary observation of a missing, changed, native, or unreadable registration latches as
+`FAIL` until `/reload`; running doctor itself neither captures nor latches request state. A Pi
+version without both public lookup methods reports `WARN` instead of treating local submission as
+acceptance.
+
+Doctor reports `OK`, `WARN`, or `FAIL` and sends no provider request. It does not validate credentials
+or quota, inspect Windows ACLs, prove every adapter's failure shape, or prove hard-link support without
+a mutation. It also cannot contain a malicious trusted extension or provider that bypasses Pi hooks,
+ignores `AbortSignal`, calls `fetch` directly, or mutates the registry outside the checked boundaries.
+If config loading failed, the disabled `/key-rotator` command shows that load error; the full doctor is
+not available yet.
 
 ## 10. State v2, locks, and fail-closed behavior
 
@@ -409,8 +420,9 @@ zero and review the separate agent-level retry setting.
 | Symptom | Cause and fix |
 |---|---|
 | footer says `keys: disabled` | local config or startup failed; run `/key-rotator` for the captured load error |
-| duplicate extension/provider registration | Pi 0.84.2 may merge a later registration instead of rejecting it; remove duplicate copies and do not treat `doctor` as proof of the winning stream |
-| managed provider sends an unrotated fallback | the selected model api does not match the target api, or another registration won; stop and fix the provider/api contract |
+| duplicate extension/provider registration | the request fence and doctor fail after the competing registration is observed; remove duplicate copies and run `/reload` |
+| managed request is refused before dispatch | the selected model API differs, pool preflight failed, or Pi did not retain the exact rotator registration; fix the cause, then run `/reload` |
+| managed provider sends an unrotated fallback | stop immediately; a trusted component bypassed or ignored the verified Pi 0.84.2 extension pipeline |
 | `No rotation entry is currently available (...)` | key, target, or pool scope is unavailable; inspect status |
 | `Credential failover exhausted N attempt(s)` | wrapper budget ended or a target/pool circuit stopped selection; Pi may still have an outer retry |
 | state corruption/security/size error | state failed closed; use recovery, not reset |
@@ -423,8 +435,17 @@ zero and review the separate agent-level retry setting.
 ## 14. How it hooks into Pi
 
 Pi 0.84.2 composes an extension `streamSimple` per registered provider and calls it only when the
-selected model's api equals the registration api. The package registers each configured target with
-an inert fallback `rotator-managed-key`, then injects the selected real key into each attempt. It does not install a global per-api dispatcher.
+selected model's API equals the registration API. The package registers each configured target with
+an inert fallback `rotator-managed-key`, then injects the selected real key into each attempt. It also
+rechecks the public provider registration and model API at `input`, every `turn_start`, and both
+provider-request hooks. A blocked request is synchronously aborted before dispatch; authentication
+header deletion is only defense in depth. Compaction and tree-summary generation are cancelled while
+the selected managed target is blocked.
+
+The verified fence covers Pi's `AgentSession` lifecycle pipeline. A trusted extension that invokes
+`ctx.modelRegistry.complete()` directly bypasses those lifecycle hooks, just like code that calls
+`fetch`, mutates the registry directly, or ignores cancellation. Such direct dispatch is out of scope.
+The package does not install a global per-API dispatcher or take over native providers.
 
 The base attempt stream is `@earendil-works/pi-ai/compat` `streamSimple`. Matching raw,
 URL-encoded, base64, and base64url credential forms in auth-like headers are rotated. Failure event

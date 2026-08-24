@@ -35,6 +35,32 @@ isolation boundary.
 The package reduces accidental disclosure and unsafe state reuse. It does not promise to hide a key
 from software that must use that key.
 
+## Managed-provider request fence
+
+Pi 0.84.2 can bypass a provider-scoped extension stream when the selected model API differs from the
+registered API. It can also merge a later registration for the same provider. Stored `auth.json`
+authentication could otherwise reach the built-in provider without entering the key pool.
+
+For every configured provider, v0.4.0 checks the selected API and Pi's public post-bind registration
+evidence at `input`, each `turn_start`, `before_provider_headers`, and `before_provider_request`. A
+healthy registration has exactly the expected API, inert `rotator-managed-key`, guarded
+`streamSimple` function, safe field set, no native provider, and the same object identity captured
+after binding. A missing, changed, native, lookup-error, or replacement observation at a request
+enforcement boundary latches until `/reload`. Doctor reads current and latched evidence without
+capturing or latching request state. A corrupt-state pool remains managed and blocked even though its
+provider registration is omitted. Direct guarded-stream mismatches also fail closed before key selection.
+
+The primary fence is synchronous `ctx.abort()` before provider dispatch. Authentication-header
+removal is defense in depth and cannot stop query-string authentication by itself. Compaction and
+tree summaries are cancelled while the selected managed provider is blocked. The pinned real-host
+suite requires both API-mismatch and later-registration cases with stored authentication to make zero
+physical requests and consume zero pool attempts.
+
+This guarantee is scoped to Pi's verified `AgentSession` lifecycle pipeline. A trusted extension can
+bypass these hooks by calling `ctx.modelRegistry.complete()` or `fetch` directly. A malicious trusted
+extension, provider, SDK, or Pi build can also mutate registry/request data, ignore `AbortSignal`, or
+bypass hooks entirely. The extension is not a sandbox for that code.
+
 ## Config and path hardening
 
 The default `<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. An explicit

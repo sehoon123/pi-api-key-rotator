@@ -1,4 +1,6 @@
 import type { KeyPool } from "./key-pool.ts";
+import { installManagedRequestFence } from "./request-fence.ts";
+import type { ManagedRequestTarget } from "./request-fence.ts";
 import { createRotatingStream } from "./rotating-stream.ts";
 import type {
   EventStreamFactory,
@@ -309,17 +311,27 @@ export async function registerKeyRotatorExtension(
     });
   };
 
+  const managedTargets = new Map<string, ManagedRequestTarget>();
+  for (const target of targets) {
+    managedTargets.set(target.provider, {
+      provider: target.provider,
+      api: target.api,
+      apiKey: MANAGED_KEY_PLACEHOLDER,
+      poolId,
+      ...(preflightFailure !== undefined ? { disabledReason: "state preflight failed" } : {}),
+    });
+  }
+
   if (preflightFailure === undefined) {
     const providerFallback = fallbackApiKey(firstKey);
     for (const target of targets) {
       // Keep a direct per-provider Pi registration and preserve the exact model
-      // object. Only the configured provider/API pair enters rotation.
+      // object. Direct mismatches are denied inside createRotatingStream.
       const guardedStream = ((model, context, options) => {
-        if (model.provider !== target.provider || model.api !== target.api) {
-          return dependencies.baseStreamSimple(model, context, options);
-        }
         const selected = selection;
         const requestOwner =
+          model.provider === target.provider &&
+          model.api === target.api &&
           selected.kind === "active" &&
           selected.target.provider === target.provider &&
           selected.target.api === target.api
@@ -341,8 +353,16 @@ export async function registerKeyRotatorExtension(
         apiKey: providerFallback,
         streamSimple: guardedStream,
       });
+      managedTargets.set(target.provider, {
+        provider: target.provider,
+        api: target.api,
+        apiKey: providerFallback,
+        poolId,
+        streamSimple: guardedStream,
+      });
     }
   }
+  installManagedRequestFence(pi, managedTargets);
 
   pi.registerCommand("key-rotator", {
     description: "Show, advance, or reset the shared API key rotation pool",

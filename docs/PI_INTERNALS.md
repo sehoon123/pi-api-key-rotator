@@ -9,13 +9,18 @@ Pi release.
 2. The default package entry loads `PI_KEY_ROTATOR_CONFIG` when set; otherwise it loads
    `<agent dir>/key-rotator.json`. `<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise
    `~/.pi/agent`. Programmatic config-loader options are not Pi package-install settings.
-3. Each configured pool creates one `KeyPool` and one state store.
-4. Each target calls `ExtensionAPI.registerProvider(providerId, config)`. During extension loading, Pi
-   queues this call; it binds and composes provider registrations later.
-5. Pi composes that extension provider with the provider from `models.json` and stored authentication.
-6. For a selected model whose `model.api` equals the registered extension `api`, Pi invokes the
+3. Each configured pool creates one `KeyPool` and one state store. A read-only `snapshot()` preflight
+   disables only a pool whose state cannot be validated and preserves that state as evidence.
+4. Each healthy target calls `ExtensionAPI.registerProvider(providerId, config)` with the inert key and
+   its exact guarded stream. During extension loading, Pi queues this call; it binds and composes
+   provider registrations later. Disabled targets are not registered but remain managed by the fence.
+5. Pi composes each healthy extension provider with `models.json` and stored authentication.
+6. At `session_start`, the fence captures Pi's public retained registration object. Every cancellable
+   request boundary rechecks its identity, exact fields, stream function, API, inert key, and absence
+   of a native provider.
+7. For a selected model whose `model.api` equals the retained extension `api`, Pi invokes the
    rotator's provider-scoped `streamSimple`.
-7. The wrapper selects a credential, calls Pi's generic compatibility `streamSimple`, classifies the
+8. The wrapper selects a credential, calls Pi's generic compatibility `streamSimple`, classifies the
    result, commits the outcome, and then exposes the final terminal event.
 
 The pinned real-host test must exercise this chain from the installed package entry, not only import
@@ -30,16 +35,26 @@ can therefore use the same api type without a shared global dispatcher.
 No global one-dispatcher-per-api layer, builtin stream capture, or private lifecycle diagnostic is
 part of this Pi package.
 
-A provider/api mismatch is security-relevant. Pi can fall through to a base or generic stream when
+A provider/API mismatch is security-relevant. Pi can fall through to a base or generic stream when
 `model.api !== registered api`, bypassing rotation. Keep the `api` value in `key-rotator.json` equal
-to the provider's `api` in `<agent dir>/models.json`. The model-selection warning and `doctor` output
-are local diagnostics, not a request fence or proof of the final host composition.
+to the provider's `api` in `<agent dir>/models.json`. v0.4.0 also checks the selected API at `input`,
+every `turn_start`, `before_provider_headers`, and `before_provider_request`. It synchronously calls
+`ctx.abort()` before provider dispatch. Header deletion is defense in depth, not the primary fence,
+because authentication can also be carried in a query string.
 
-Pi 0.84.2 also merges a later registration for the same provider over fields from an earlier one. It
-does not definitively reject duplicate provider registrations. Load order can therefore replace the
-rotator's stream. The real-host suite must cover both an API mismatch and a later competing
-registration with stored `auth.json` credentials; a safe result makes no authenticated physical
-request and consumes no pool attempt.
+Pi 0.84.2 merges a later registration for the same provider over fields from an earlier one; it does
+not definitively reject duplicate provider registrations. The fence therefore uses
+`getRegisteredProviderConfig()` and `getRegisteredNativeProvider()` to require exactly `api`,
+`apiKey`, and `streamSimple`, their expected values/function identity, no native registration, and
+the same registration object captured post-bind. Missing, changed, lookup-error, native, or
+replacement evidence at a request boundary latches until extension reload. Compaction and tree summary generation are
+cancelled while the managed target is blocked.
+
+The real-host suite covers both an API mismatch and a later competing registration with stored
+`auth.json` credentials; a safe result makes no physical request and consumes no pool attempt. This fence applies to Pi's verified `AgentSession` lifecycle pipeline. A trusted extension
+can bypass it by calling `ctx.modelRegistry.complete()` or `fetch` directly. It also cannot contain a
+malicious trusted extension or provider that mutates registry/request data, ignores `AbortSignal`, or
+otherwise bypasses Pi's request hooks.
 
 ## 3. Base stream
 
@@ -126,12 +141,18 @@ to terminate the process tree, but detached descendants can survive.
 
 ## 10. Doctor boundary
 
-`/key-rotator doctor` is read-only and sends no provider request. Its target check compares config
-with the provider/api pairs captured immediately after this extension made its own local registration
-calls. It does not query Pi's final composed provider, confirm that queued registration later bound,
-or detect a later/duplicate winner. It also cannot validate credentials, quota, Windows ACLs, every
-adapter's diagnostic behavior, hard-link mutation without writing, or Pi's future retry
-classification.
+`/key-rotator doctor` is read-only and sends no provider request. On Pi 0.84.2 its target check reads
+the same public post-bind registration evidence as the request fence. Exact retained evidence is
+`OK`; disabled, missing, overwritten, native, replacement, or lookup-error evidence is `FAIL`. Doctor
+reads current and already-latched evidence but does not capture identity or latch a new violation. A
+violation observed by a request-enforcement boundary remains latched until reload. If a
+wildcard-compatible Pi version does not
+expose both lookup methods, doctor reports `WARN` rather than treating a local registration call as
+host acceptance.
+
+Doctor does not call a provider or validate credentials, quota, Windows ACLs, every adapter's
+diagnostic behavior, hard-link mutation without writing, or Pi's future retry classification. Public
+registry evidence is not a sandbox or proof against trusted code that bypasses the Pi pipeline.
 
 ## 11. Package and module resolution
 
@@ -149,11 +170,14 @@ Before documenting support for another Pi version:
 
 1. Pin that exact Pi and pi-ai version in a contract-test job.
 2. Load the packed package through the real extension loader.
-3. Recheck provider/api match and fallback authentication resolution.
-4. Drive real OpenAI-compatible non-2xx and Anthropic in-band errors against local servers.
-5. Verify `onResponse`, `Retry-After`, abort, callback, and terminal event shapes.
-6. Verify the semantic boundary and that a durable-state failure suppresses the provider terminal.
-7. Measure Pi agent-level and provider-level retry behavior; derive it from Pi directly.
-8. Run the Windows and POSIX process-lock suites.
-9. Review upstream logging before claiming a redaction boundary.
-10. Update README, SECURITY, CHANGELOG, and the release compatibility table only after all checks pass.
+3. Recheck provider/API match, fallback authentication resolution, both public registry lookups, and
+   every cancellable fence hook.
+4. Re-run stored-`auth.json` mismatch and later competing-registration cases and require zero
+   authenticated physical calls and zero pool attempts.
+5. Drive real OpenAI-compatible non-2xx and Anthropic in-band errors against local servers.
+6. Verify `onResponse`, `Retry-After`, abort, callback, and terminal event shapes.
+7. Verify the semantic boundary and that a durable-state failure suppresses the provider terminal.
+8. Measure Pi agent-level and provider-level retry behavior; derive it from Pi directly.
+9. Run the Windows and POSIX process-lock suites.
+10. Review upstream logging before claiming a redaction boundary.
+11. Update README, SECURITY, CHANGELOG, and the release compatibility table only after all checks pass.

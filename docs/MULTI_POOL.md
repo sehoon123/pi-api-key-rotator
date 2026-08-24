@@ -144,7 +144,8 @@ run.
 - There are at most 128 pools, 128 targets per pool, and 256 keys per pool.
 - Pool ids are unique case-insensitively.
 - Provider ids are unique inside this rotator config, both within one pool and across independent
-  pools. This does not detect another Pi extension registering the same provider.
+  pools. The loader cannot reject another Pi extension's later registration, so the runtime fence
+  checks Pi's retained registration and latches a conflict until reload.
 - Every pool needs at least two keys, with unique ids and resolved values.
 - The config and every state, lock, reclaim, and backup artifact must have a unique lexical and
   physical location.
@@ -193,5 +194,6 @@ Active-pool inference:
    mutating an arbitrary pool.
 
 The footer shows the active pool. Without one, it shows `N independent key pools`. `doctor` always
-checks all pools and accepts no selector. It reads state without creating a lock or changing mtime,
-and sends no provider request.
+checks all pools and accepts no selector. It reads state and fixed lock evidence without creating a
+lock or changing mtime, checks public Pi post-bind registration evidence, and sends no provider
+request.

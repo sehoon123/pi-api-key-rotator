@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, lstat, open, readFile } from "node:fs/promises";
 import { MAX_CONFIG_BYTES } from "./config.ts";
 import { inspectConfigFile } from "./pi-host.ts";
+import type { RegistrationEvidence } from "./request-fence.ts";
 import type { RotatorConfig, RotatorTarget } from "./types.ts";
 
 export type DoctorSeverity = "OK" | "WARN" | "FAIL";
@@ -22,8 +23,10 @@ export interface DoctorReport {
 export interface DoctorInput {
   configFile: string;
   pools: readonly RotatorConfig[];
-  /** Provider -> API pairs captured after Pi accepted every registration. */
-  registeredTargets: ReadonlyMap<string, string>;
+  /** Legacy local submission map. It is never treated as host acceptance. */
+  registeredTargets?: ReadonlyMap<string, string>;
+  /** Pi post-bind evidence captured through ModelRegistry public methods. */
+  registrationEvidence?: ReadonlyMap<string, RegistrationEvidence>;
   /** Read-only runtime validation keyed by pool ID. */
   stateReaders?: ReadonlyMap<string, () => Promise<unknown>>;
 }
@@ -334,27 +337,70 @@ async function lockCheck(config: RotatorConfig): Promise<DoctorCheck> {
 function targetCheck(
   id: string,
   target: RotatorTarget,
-  registeredTargets: ReadonlyMap<string, string>,
+  registeredTargets: ReadonlyMap<string, string> | undefined,
+  evidenceByProvider: ReadonlyMap<string, RegistrationEvidence> | undefined,
 ): DoctorCheck {
-  const registeredApi = registeredTargets.get(target.provider);
-  if (registeredApi === undefined) {
-    return {
-      severity: "FAIL",
-      subject: `Target (${id}/${target.provider})`,
-      detail: `provider was not registered for ${target.api}`,
-    };
+  const subject = `Target (${id}/${target.provider})`;
+  const evidence = evidenceByProvider?.get(target.provider);
+  if (evidence) {
+    switch (evidence.status) {
+      case "verified":
+        return {
+          severity: "OK",
+          subject,
+          detail: `Pi retained the exact key-rotator stream for ${target.api}`,
+        };
+      case "unverified":
+        return {
+          severity: "WARN",
+          subject,
+          detail: `local submission uses ${target.api}, but this Pi version exposes no post-bind acknowledgement`,
+        };
+      case "disabled":
+        return {
+          severity: "FAIL",
+          subject,
+          detail: `pool state preflight disabled registration for ${target.api}`,
+        };
+      case "missing":
+        return {
+          severity: "FAIL",
+          subject,
+          detail: `Pi did not retain a provider registration for ${target.api}`,
+        };
+      case "overwritten":
+        return {
+          severity: "FAIL",
+          subject,
+          detail:
+            evidence.observedApi === undefined
+              ? `another registration replaced the expected ${target.api} stream`
+              : `registered for ${evidence.observedApi}, expected ${target.api}`,
+        };
+      case "lookup-error":
+        return {
+          severity: "FAIL",
+          subject,
+          detail: "Pi registration acknowledgement could not be read safely",
+        };
+    }
   }
-  if (registeredApi !== target.api) {
+
+  const submittedApi = registeredTargets?.get(target.provider);
+  if (submittedApi !== undefined && submittedApi !== target.api) {
     return {
       severity: "FAIL",
-      subject: `Target (${id}/${target.provider})`,
-      detail: `registered for ${registeredApi}, expected ${target.api}`,
+      subject,
+      detail: `local submission used ${submittedApi}, expected ${target.api}`,
     };
   }
   return {
-    severity: "OK",
-    subject: `Target (${id}/${target.provider})`,
-    detail: `${target.api} registered locally`,
+    severity: "WARN",
+    subject,
+    detail:
+      submittedApi === undefined
+        ? `no post-bind acknowledgement is available for ${target.api}`
+        : `${target.api} was submitted locally, but Pi acceptance was not verified`,
   };
 }
 
@@ -366,7 +412,9 @@ export async function buildDoctorReport(input: DoctorInput): Promise<DoctorRepor
     checks.push(await stateCheck(config, input.stateReaders?.get(id)));
     checks.push(await lockCheck(config));
     for (const target of targets(config)) {
-      checks.push(targetCheck(id, target, input.registeredTargets));
+      checks.push(
+        targetCheck(id, target, input.registeredTargets, input.registrationEvidence),
+      );
     }
   }
 
