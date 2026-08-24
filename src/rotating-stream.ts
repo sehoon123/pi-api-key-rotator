@@ -979,11 +979,32 @@ async function runAttempt(
   return { outcome: "retry-network", response, error };
 }
 
+function configuredTargetApi(config: RotatorConfig, provider: string): string | undefined {
+  const configuredTargets = config.targets?.length
+    ? config.targets
+    : [{ provider: config.provider, api: config.api }];
+  return configuredTargets.find((target) => target.provider === provider)?.api;
+}
+
 export function createRotatingStream(deps: RotatingStreamDependencies): StreamSimpleLike {
   return (model, context, options) => {
     const output = deps.createEventStream();
     const errorConfig = requestRedactionConfig(deps.config, options);
     let lastVisiblePartial: AssistantMessageLike | undefined;
+
+    const expectedApi = configuredTargetApi(deps.config, model.provider);
+    if (expectedApi === undefined || model.api !== expectedApi) {
+      emitSyntheticError(
+        output,
+        model,
+        expectedApi === undefined
+          ? `Provider "${model.provider}" is not managed by this credential pool.`
+          : `Provider "${model.provider}" is configured for API "${expectedApi}", not "${model.api}".`,
+        "error",
+        errorConfig,
+      );
+      return output;
+    }
 
     void (async () => {
       const excludedKeyIds = new Set<string>();

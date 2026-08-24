@@ -293,6 +293,37 @@ test("exhausted failover emits one sanitized terminal error", async () => {
   assert.doesNotMatch(JSON.stringify(error), /secret-one|secret-two/);
 });
 
+test("a model outside the configured provider/API target fails closed before pool selection", async () => {
+  const config = makeConfig();
+  const { pool } = setup(config);
+  let calls = 0;
+  const rotating = createRotatingStream({
+    config,
+    pool,
+    baseStreamSimple: () => {
+      calls += 1;
+      return new TestEventStream();
+    },
+    createEventStream: () => new TestEventStream(),
+  });
+
+  for (const receivedModel of [
+    { ...model, api: "openai-responses" },
+    { ...model, provider: "unmanaged-provider" },
+  ]) {
+    const events = await collect(rotating(receivedModel, { messages: [] }, { apiKey: "stored-host-secret" }));
+    assert.deepEqual(events.map((event) => event.type), ["error"]);
+    const terminal = events[0] as unknown as { type: string; error?: { errorMessage?: string } };
+    assert.equal(
+      terminal.type === "error" ? terminal.error?.errorMessage : "",
+      "The credential rotator stopped this request. Review diagnostics for details.",
+    );
+  }
+
+  assert.equal(calls, 0);
+  assert.equal((await pool.snapshot()).totalAttempts, 0);
+});
+
 test("an already aborted signal performs no provider call", async () => {
   const config = makeConfig();
   const { pool } = setup(config);
@@ -1517,7 +1548,7 @@ test("status text fallback is anchored and limited to Pi adapters with known for
     ["google-generative-ai", "503: busy", 503],
     ["bedrock-converse-stream", "429 rate limited", null],
   ] as const) {
-    const config = makeConfig({ retryNetworkErrors: false });
+    const config = makeConfig({ api, retryNetworkErrors: false });
     const { pool } = setup(config);
     const rotating = createRotatingStream({
       config,
