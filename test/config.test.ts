@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { test } from "node:test";
 import {
   ConfigNotFoundError,
@@ -12,6 +12,8 @@ import {
   physicalInodeIdentity,
   resolveConfig,
 } from "../src/config.ts";
+import { loadConfigSet } from "../src/config-set.ts";
+import { PI_HOST_RESERVED_FILE_NAMES, resolveAgentDir } from "../src/pi-host.ts";
 import type { RawRotatorConfig } from "../src/types.ts";
 
 const validRaw: RawRotatorConfig = {
@@ -22,6 +24,15 @@ const validRaw: RawRotatorConfig = {
     { id: "secondary", env: "KEY_TWO" },
   ],
   requestsPerKey: 7,
+};
+
+const commandRaw: RawRotatorConfig = {
+  provider: "company-ai",
+  api: "openai-completions",
+  keys: [
+    { id: "primary", command: "resolve-primary" },
+    { id: "secondary", command: "resolve-secondary" },
+  ],
 };
 
 test("zero inode values are treated as unavailable rather than shared identity", () => {
@@ -156,6 +167,31 @@ test("PI_CODING_AGENT_DIR moves the default config and state together", async ()
   }
 });
 
+test("a plain relative PI_CODING_AGENT_DIR is made absolute exactly once", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".pi-key-rotator-relative-agent-"));
+  const agentDirectory = join(root, "agent-relative");
+  const relativeOverride = relative(process.cwd(), agentDirectory);
+  const configFile = join(agentDirectory, "key-rotator.json");
+  await mkdir(agentDirectory, { recursive: true });
+  await writeFile(configFile, JSON.stringify(validRaw), { encoding: "utf8", mode: 0o600 });
+  try {
+    const env = {
+      KEY_ONE: "one",
+      KEY_TWO: "two",
+      PI_CODING_AGENT_DIR: relativeOverride,
+    };
+    assert.equal(resolveAgentDir({ env, homeDir: root }), agentDirectory);
+    assert.equal(isAbsolute(resolveAgentDir({ env, homeDir: root })), true);
+
+    const config = await loadConfig({ homeDir: root, env });
+    assert.equal(config.configFile, configFile);
+    assert.equal(config.stateFile, join(agentDirectory, "key-rotator-company-ai.state.json"));
+    assert.doesNotMatch(config.stateFile, /agent-relative[/\\]agent-relative/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("PI_KEY_ROTATOR_CONFIG wins over PI_CODING_AGENT_DIR for the config path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-key-rotator-env-"));
   const configFile = join(directory, "custom.json");
@@ -241,6 +277,210 @@ test("stateFile cannot collide with the configuration or its state sidecars", ()
       ),
     /must not resolve to the configuration file/,
   );
+});
+
+test("Pi host-reserved files are refused before command resolvers run", async () => {
+  const requiredNames = [
+    "auth.json",
+    "models.json",
+    "settings.json",
+    "keybindings.json",
+    "models-store.json",
+  ];
+  const reservedNames = new Set<string>(PI_HOST_RESERVED_FILE_NAMES);
+  for (const name of requiredNames) assert.ok(reservedNames.has(name));
+
+  const root = await mkdtemp(join(tmpdir(), "pi-key-rotator-host-files-"));
+  const agentDirectory = join(root, "agent");
+  const configFile = join(agentDirectory, "key-rotator.json");
+  await mkdir(agentDirectory, { recursive: true });
+  let commandRuns = 0;
+  try {
+    for (const name of PI_HOST_RESERVED_FILE_NAMES) {
+      await writeFile(
+        configFile,
+        JSON.stringify({ ...commandRaw, stateFile: join(agentDirectory, name) }),
+        { encoding: "utf8", mode: 0o600 },
+      );
+      await assert.rejects(
+        () =>
+          loadConfig({
+            configFile,
+            homeDir: root,
+            env: { PI_CODING_AGENT_DIR: agentDirectory },
+            runCommand: async () => {
+              commandRuns += 1;
+              return { stdout: "must-not-run", code: 0, timedOut: false };
+            },
+          }),
+        (error: unknown) =>
+          error instanceof ConfigValidationError &&
+          error.message.includes(`Pi host file "${name}"`),
+      );
+    }
+    assert.equal(commandRuns, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("every fixed and unique state sidecar namespace is reserved before commands run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-key-rotator-sidecars-"));
+  const agentDirectory = join(root, "agent");
+  const nonce = crypto.randomUUID();
+  const cases = [
+    ["state", (base: string) => base],
+    ["lock", (base: string) => `${base}.lock`],
+    ["reclaim", (base: string) => `${base}.lock.reclaim`],
+    ["backup", (base: string) => `${base}.bak`],
+    ["state-temp", (base: string) => `${base}.${process.pid}.${nonce}.tmp`],
+    ["backup-temp", (base: string) => `${base}.bak.${process.pid}.${nonce}.tmp`],
+    ["lock-candidate", (base: string) => `${base}.lock.${nonce}.candidate`],
+  ] as const;
+  let commandRuns = 0;
+  try {
+    for (const [label, configPath] of cases) {
+      const stateFile = join(root, `${label}.state.json`);
+      const configFile = configPath(stateFile);
+      await writeFile(configFile, JSON.stringify({ ...commandRaw, stateFile }), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await assert.rejects(
+        () =>
+          loadConfig({
+            configFile,
+            homeDir: root,
+            env: { PI_CODING_AGENT_DIR: agentDirectory },
+            runCommand: async () => {
+              commandRuns += 1;
+              return { stdout: "must-not-run", code: 0, timedOut: false };
+            },
+          }),
+        (error: unknown) =>
+          error instanceof ConfigValidationError && /state sidecar|sidecars overlap/u.test(error.message),
+      );
+    }
+    assert.equal(commandRuns, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "physical validation resolves absent leaves through symlinked directories without rejecting safe paths",
+  { skip: process.platform === "win32" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-key-rotator-absent-alias-"));
+    const realAgentDirectory = join(root, "real-agent");
+    const aliasAgentDirectory = join(root, "alias-agent");
+    const configFile = join(root, "key-rotator.json");
+    await mkdir(realAgentDirectory);
+    await symlink(realAgentDirectory, aliasAgentDirectory, "dir");
+    let commandRuns = 0;
+    const runCommand = async (command: string) => {
+      commandRuns += 1;
+      return { stdout: `secret-${command}`, code: 0, timedOut: false };
+    };
+    try {
+      await writeFile(
+        configFile,
+        JSON.stringify({ ...commandRaw, stateFile: join(realAgentDirectory, "auth.json") }),
+        { mode: 0o600 },
+      );
+      await assert.rejects(
+        () =>
+          loadConfig({
+            configFile,
+            homeDir: root,
+            env: { PI_CODING_AGENT_DIR: aliasAgentDirectory },
+            runCommand,
+          }),
+        /Pi host file "auth\.json"|same file or location/u,
+      );
+      assert.equal(commandRuns, 0);
+
+      const safeStateFile = join(aliasAgentDirectory, "safe-state.json");
+      await writeFile(configFile, JSON.stringify({ ...commandRaw, stateFile: safeStateFile }), { mode: 0o600 });
+      const loaded = await loadConfig({
+        configFile,
+        homeDir: root,
+        env: { PI_CODING_AGENT_DIR: aliasAgentDirectory },
+        runCommand,
+      });
+      assert.equal(loaded.stateFile, safeStateFile);
+      assert.equal(commandRuns, 2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("existing hard-link aliases to Pi host files are refused before commands run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-key-rotator-hardlink-host-"));
+  const agentDirectory = join(root, "agent");
+  const configFile = join(root, "key-rotator.json");
+  const authFile = join(agentDirectory, "auth.json");
+  const stateFile = join(root, "state-hardlink.json");
+  await mkdir(agentDirectory);
+  await writeFile(authFile, "host-owned\n", { mode: 0o600 });
+  await link(authFile, stateFile);
+  await writeFile(configFile, JSON.stringify({ ...commandRaw, stateFile }), { mode: 0o600 });
+  let commandRuns = 0;
+  try {
+    await assert.rejects(
+      () =>
+        loadConfig({
+          configFile,
+          homeDir: root,
+          env: { PI_CODING_AGENT_DIR: agentDirectory },
+          runCommand: async () => {
+            commandRuns += 1;
+            return { stdout: "must-not-run", code: 0, timedOut: false };
+          },
+        }),
+      /same file or location/u,
+    );
+    assert.equal(commandRuns, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("multi-pool state paths cannot enter another pool's unique sidecar namespace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-key-rotator-pool-sidecars-"));
+  const configFile = join(root, "key-rotator.json");
+  const firstState = join(root, "first.state.json");
+  const secondState = `${firstState}.lock.${crypto.randomUUID()}.candidate`;
+  await writeFile(
+    configFile,
+    JSON.stringify({
+      pools: [
+        { ...commandRaw, poolId: "first", provider: "first-provider", stateFile: firstState },
+        { ...commandRaw, poolId: "second", provider: "second-provider", stateFile: secondState },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  let commandRuns = 0;
+  try {
+    await assert.rejects(
+      () =>
+        loadConfigSet({
+          configFile,
+          homeDir: root,
+          env: { PI_CODING_AGENT_DIR: join(root, "agent") },
+          runCommand: async () => {
+            commandRuns += 1;
+            return { stdout: "must-not-run", code: 0, timedOut: false };
+          },
+        }),
+      /lock candidate sidecars overlap/u,
+    );
+    assert.equal(commandRuns, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("maxStateFileBytes is bounded and defaults to one MiB", () => {

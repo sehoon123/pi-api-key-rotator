@@ -4,7 +4,7 @@
  */
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 /** Config path override understood by this extension. */
 export const CONFIG_PATH_ENV = "PI_KEY_ROTATOR_CONFIG";
@@ -12,6 +12,15 @@ export const CONFIG_PATH_ENV = "PI_KEY_ROTATOR_CONFIG";
 export const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 export const AGENT_DIR_SEGMENTS = [".pi", "agent"] as const;
 export const CONFIG_FILE_NAME = "key-rotator.json";
+/** Files owned by Pi itself in the agent directory, not by this extension. */
+export const PI_HOST_RESERVED_FILE_NAMES = [
+  "auth.json",
+  "models.json",
+  "settings.json",
+  "keybindings.json",
+  "models-store.json",
+  "oauth.json",
+] as const;
 export const stateFileName = (poolId: string): string => `key-rotator-${poolId}.state.json`;
 
 /** Path template used in messages and as the documented default. */
@@ -33,8 +42,16 @@ export function resolveAgentDir(options: PathEnvironment = {}): string {
   const env = options.env ?? process.env;
   const homeDir = options.homeDir ?? homedir();
   const override = env[AGENT_DIR_ENV]?.trim();
-  if (override) return expandHome(override, homeDir);
-  return join(homeDir, ...AGENT_DIR_SEGMENTS);
+  // Resolve a plain relative override here. If it remains relative, the config
+  // loader resolves it once and then resolves the default state path relative
+  // to that config directory a second time, duplicating the override segment.
+  if (override) return resolve(expandHome(override, homeDir));
+  return resolve(homeDir, ...AGENT_DIR_SEGMENTS);
+}
+
+export function piHostReservedFiles(options: PathEnvironment = {}): string[] {
+  const agentDir = resolveAgentDir(options);
+  return PI_HOST_RESERVED_FILE_NAMES.map((name) => join(agentDir, name));
 }
 
 export function defaultConfigFile(options: PathEnvironment = {}): string {

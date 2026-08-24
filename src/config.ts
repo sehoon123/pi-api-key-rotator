@@ -9,6 +9,7 @@ import {
   expandHome,
   inspectConfigFile,
   MAX_SECRET_UTF8_BYTES,
+  piHostReservedFiles,
   runShellCommand,
   selectConfigPath,
 } from "./pi-host.ts";
@@ -135,23 +136,81 @@ function resolvePath(input: string, homeDir: string, baseDir?: string): string {
 function canonicalPath(input: string): string {
   // Being case-insensitive here is deliberately stricter on Linux. It avoids a
   // configuration that becomes destructive when copied to Windows or macOS.
-  return normalize(resolve(input)).replaceAll("\\", "/").toLocaleLowerCase("en-US");
+  return normalize(resolve(input))
+    .replaceAll("\\", "/")
+    .toLocaleLowerCase("en-US")
+    .normalize("NFC");
 }
 
-function rejectStateConfigCollision(stateFile: string, configFile: string): void {
-  const configPath = canonicalPath(configFile);
-  const stateArtifacts = [stateFile, `${stateFile}.lock`, `${stateFile}.lock.reclaim`, `${stateFile}.bak`];
-  if (stateArtifacts.some((candidate) => canonicalPath(candidate) === configPath)) {
+interface StateArtifactPath {
+  path: string;
+  owner: string;
+}
+
+function fixedStateArtifacts(stateFile: string, id: string): StateArtifactPath[] {
+  return [
+    { path: stateFile, owner: `pool "${id}" state` },
+    { path: `${stateFile}.lock`, owner: `pool "${id}" lock` },
+    { path: `${stateFile}.lock.reclaim`, owner: `pool "${id}" lock reclaim` },
+    { path: `${stateFile}.bak`, owner: `pool "${id}" backup` },
+  ];
+}
+
+/** Return the unique sidecar kind when a path is in a store's dynamic namespace. */
+function dynamicStateArtifactKind(candidate: string, stateFile: string): string | undefined {
+  if (!candidate.startsWith(stateFile)) return undefined;
+  const suffix = candidate.slice(stateFile.length);
+  if (/^\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(suffix)) return "state temporary";
+  if (/^\.bak\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(suffix)) return "backup temporary";
+  if (/^\.lock\.[0-9a-f-]{36}\.candidate$/u.test(suffix)) return "lock candidate";
+  return undefined;
+}
+
+function rejectStateProtectedCollision(
+  stateFile: string,
+  configFile: string,
+  reservedFiles: readonly string[],
+): void {
+  const statePath = canonicalPath(stateFile);
+  const protectedFiles = [
+    { path: configFile, owner: "the configuration file", config: true },
+    ...reservedFiles.map((path) => ({ path, owner: `Pi host file "${basename(path)}"`, config: false })),
+  ];
+  const stateArtifacts = fixedStateArtifacts(stateFile, "configured");
+
+  for (const protectedFile of protectedFiles) {
+    const protectedPath = canonicalPath(protectedFile.path);
+    const fixedCollision = stateArtifacts.some(
+      (artifact) => canonicalPath(artifact.path) === protectedPath,
+    );
+    const dynamicCollision = dynamicStateArtifactKind(protectedPath, statePath);
+    if (!fixedCollision && dynamicCollision === undefined) continue;
+    if (protectedFile.config) {
+      throw new ConfigValidationError(
+        configFile,
+        '"stateFile" and every state sidecar must not resolve to the configuration file.',
+      );
+    }
     throw new ConfigValidationError(
       configFile,
-      '"stateFile" and its lock/backup files must not resolve to the configuration file.',
+      `"stateFile" and every state sidecar must not resolve to ${protectedFile.owner}.`,
     );
   }
 }
 
+interface ConfigFilesystemContext {
+  hostReservedFiles: readonly string[];
+}
+
+const configFilesystemContexts = new WeakMap<RotatorConfig, ConfigFilesystemContext>();
+
 interface PhysicalPathIdentity {
   canonical: string;
   inode?: string;
+}
+
+interface IdentifiedPath extends StateArtifactPath {
+  identity: PhysicalPathIdentity;
 }
 
 /** FAT/exFAT and some Windows/network filesystems use zero when inode identity is unavailable. */
@@ -159,35 +218,51 @@ export function physicalInodeIdentity(dev: bigint, ino: bigint): string | undefi
   return ino === 0n ? undefined : `${dev}:${ino}`;
 }
 
-async function physicalPathIdentity(input: string, configFile: string): Promise<PhysicalPathIdentity> {
+async function physicalPathIdentity(
+  input: string,
+  configFile: string,
+  options: { validateExistingArtifact: boolean },
+): Promise<PhysicalPathIdentity> {
   let cursor = resolve(input);
   const missingSuffix: string[] = [];
   while (true) {
     try {
       const entry = await lstat(cursor);
-      if (missingSuffix.length > 0 && !entry.isDirectory()) {
-        throw new ConfigValidationError(
-          configFile,
-          `A state path ancestor is not a directory: ${cursor}`,
-        );
-      }
-      if (missingSuffix.length === 0 && !entry.isFile()) {
-        throw new ConfigValidationError(
-          configFile,
-          `An existing config/state artifact is not a regular file: ${cursor}`,
-        );
-      }
-      if (missingSuffix.length === 0 && process.platform !== "win32") {
-        const effectiveUid = process.geteuid?.() ?? process.getuid?.();
-        if (effectiveUid === undefined || entry.uid !== effectiveUid || (entry.mode & 0o022) !== 0) {
+      if (missingSuffix.length > 0) {
+        // Follow a directory symlink here. Only a symlink at the artifact leaf
+        // itself is unsafe; symlinked directory ancestors are normal and their
+        // real location is needed to compare an absent leaf correctly.
+        const followed = await stat(cursor);
+        if (!followed.isDirectory()) {
           throw new ConfigValidationError(
             configFile,
-            `An existing config/state artifact has unsafe ownership or write permissions: ${cursor}`,
+            `A state path ancestor is not a directory: ${cursor}`,
           );
         }
+      } else if (options.validateExistingArtifact) {
+        if (!entry.isFile()) {
+          throw new ConfigValidationError(
+            configFile,
+            `An existing config/state artifact is not a regular file: ${cursor}`,
+          );
+        }
+        if (process.platform !== "win32") {
+          const effectiveUid = process.geteuid?.() ?? process.getuid?.();
+          if (effectiveUid === undefined || entry.uid !== effectiveUid || (entry.mode & 0o022) !== 0) {
+            throw new ConfigValidationError(
+              configFile,
+              `An existing config/state artifact has unsafe ownership or write permissions: ${cursor}`,
+            );
+          }
+        }
+      } else {
+        // A Pi-owned reference can itself be a symlink. Follow it so an
+        // explicitly configured state path cannot target the same real file.
+        await stat(cursor);
       }
+
       const resolvedAncestor = await realpath(cursor);
-      const canonical = canonicalPath(resolve(resolvedAncestor, ...missingSuffix)).normalize("NFC");
+      const canonical = canonicalPath(resolve(resolvedAncestor, ...missingSuffix));
       if (missingSuffix.length > 0) return { canonical };
       const metadata = await stat(resolvedAncestor, { bigint: true });
       const inode = physicalInodeIdentity(metadata.dev, metadata.ino);
@@ -203,39 +278,103 @@ async function physicalPathIdentity(input: string, configFile: string): Promise<
   }
 }
 
+function collisionOwner(
+  identity: PhysicalPathIdentity,
+  canonicalOwners: ReadonlyMap<string, string>,
+  inodeOwners: ReadonlyMap<string, string>,
+): string | undefined {
+  return canonicalOwners.get(identity.canonical) ??
+    (identity.inode === undefined ? undefined : inodeOwners.get(identity.inode));
+}
+
+function recordIdentity(
+  identified: IdentifiedPath,
+  canonicalOwners: Map<string, string>,
+  inodeOwners: Map<string, string>,
+): void {
+  if (!canonicalOwners.has(identified.identity.canonical)) {
+    canonicalOwners.set(identified.identity.canonical, identified.owner);
+  }
+  if (identified.identity.inode !== undefined && !inodeOwners.has(identified.identity.inode)) {
+    inodeOwners.set(identified.identity.inode, identified.owner);
+  }
+}
+
 /**
  * Resolve symlinked ancestors and existing inode aliases before any command key
- * is executed. This closes lexical `stateFile` collision bypasses that could
- * otherwise turn the config itself into a stale lock or backup destination.
+ * is executed. The comparison includes Pi-owned files and every fixed or unique
+ * state-store sidecar namespace.
  */
 export async function validatePhysicalStatePaths(
   pools: readonly RotatorConfig[],
   configFile: string,
 ): Promise<void> {
+  const protectedPaths: StateArtifactPath[] = [
+    { path: configFile, owner: "the configuration file" },
+  ];
+  const seenProtectedPaths = new Set([canonicalPath(configFile)]);
+  for (const config of pools) {
+    for (const path of configFilesystemContexts.get(config)?.hostReservedFiles ?? []) {
+      const lexical = canonicalPath(path);
+      if (seenProtectedPaths.has(lexical)) continue;
+      seenProtectedPaths.add(lexical);
+      protectedPaths.push({ path, owner: `Pi host file "${basename(path)}"` });
+    }
+  }
+
+  const protectedIdentities: IdentifiedPath[] = [];
+  for (const item of protectedPaths) {
+    protectedIdentities.push({
+      ...item,
+      identity: await physicalPathIdentity(item.path, configFile, {
+        validateExistingArtifact: item.path === configFile,
+      }),
+    });
+  }
+
   const canonicalOwners = new Map<string, string>();
   const inodeOwners = new Map<string, string>();
+  for (const item of protectedIdentities) recordIdentity(item, canonicalOwners, inodeOwners);
 
-  const add = async (path: string, owner: string): Promise<void> => {
-    const identity = await physicalPathIdentity(path, configFile);
-    const previous = canonicalOwners.get(identity.canonical) ??
-      (identity.inode === undefined ? undefined : inodeOwners.get(identity.inode));
-    if (previous) {
-      throw new ConfigValidationError(
-        configFile,
-        `Filesystem paths for ${previous} and ${owner} resolve to the same file or location.`,
-      );
-    }
-    canonicalOwners.set(identity.canonical, owner);
-    if (identity.inode !== undefined) inodeOwners.set(identity.inode, owner);
-  };
-
-  await add(configFile, "the configuration file");
+  const stateIdentities: IdentifiedPath[] = [];
+  const stateBases: Array<{ owner: string; canonical: string }> = [];
   for (const config of pools) {
     const id = config.poolId ?? config.provider;
-    await add(config.stateFile, `pool "${id}" state`);
-    await add(`${config.stateFile}.lock`, `pool "${id}" lock`);
-    await add(`${config.stateFile}.lock.reclaim`, `pool "${id}" lock reclaim`);
-    await add(`${config.stateFile}.bak`, `pool "${id}" backup`);
+    const artifacts = fixedStateArtifacts(config.stateFile, id);
+    for (const artifact of artifacts) {
+      const identified = {
+        ...artifact,
+        identity: await physicalPathIdentity(artifact.path, configFile, {
+          validateExistingArtifact: true,
+        }),
+      };
+      const previous = collisionOwner(identified.identity, canonicalOwners, inodeOwners);
+      if (previous) {
+        throw new ConfigValidationError(
+          configFile,
+          `Filesystem paths for ${previous} and ${identified.owner} resolve to the same file or location.`,
+        );
+      }
+      recordIdentity(identified, canonicalOwners, inodeOwners);
+      stateIdentities.push(identified);
+      if (artifact.path === config.stateFile) {
+        stateBases.push({ owner: identified.owner, canonical: identified.identity.canonical });
+      }
+    }
+  }
+
+  // The store also creates three unique namespaces whose PID/nonce portion is
+  // not known until mutation. Reserve the whole namespace rather than checking
+  // only a nonce sampled during config loading.
+  for (const base of stateBases) {
+    for (const candidate of [...protectedIdentities, ...stateIdentities]) {
+      const kind = dynamicStateArtifactKind(candidate.identity.canonical, base.canonical);
+      if (kind === undefined) continue;
+      throw new ConfigValidationError(
+        configFile,
+        `Filesystem paths for ${candidate.owner} and ${base.owner} ${kind} sidecars overlap.`,
+      );
+    }
   }
 }
 
@@ -994,9 +1133,10 @@ export function resolveConfig(
       ? defaultStateFile(poolId, { env, homeDir })
       : requireDisplayString(raw.stateFile, "stateFile", MAX_STATE_PATH_LENGTH, configFile);
   const stateFile = resolvePath(configuredStateFile, homeDir, dirname(configFile));
-  rejectStateConfigCollision(stateFile, configFile);
+  const hostReservedFiles = piHostReservedFiles({ env, homeDir });
+  rejectStateProtectedCollision(stateFile, configFile, hostReservedFiles);
 
-  return {
+  const config: RotatorConfig = {
     poolId,
     targets,
     provider: primaryTarget.provider,
@@ -1020,6 +1160,8 @@ export function resolveConfig(
     configFile,
     configRevision: options.configRevision ?? "0",
   };
+  configFilesystemContexts.set(config, { hostReservedFiles });
+  return config;
 }
 
 export function validateCommandBudget(configs: readonly RotatorConfig[], configFile: string): void {
