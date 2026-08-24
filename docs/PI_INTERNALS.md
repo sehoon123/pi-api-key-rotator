@@ -6,11 +6,12 @@ Pi release.
 ## 1. Verified call chain
 
 1. Pi discovers `src/index.ts` through `package.json` → `pi.extensions`.
-2. The default extension factory loads the file selected by explicit loader option, then
-   `PI_KEY_ROTATOR_CONFIG`, then `<agent dir>/key-rotator.json`. `<agent dir>` is
-   `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`.
+2. The default package entry loads `PI_KEY_ROTATOR_CONFIG` when set; otherwise it loads
+   `<agent dir>/key-rotator.json`. `<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise
+   `~/.pi/agent`. Programmatic config-loader options are not Pi package-install settings.
 3. Each configured pool creates one `KeyPool` and one state store.
-4. Each target is registered with `ExtensionAPI.registerProvider(providerId, config)`.
+4. Each target calls `ExtensionAPI.registerProvider(providerId, config)`. During extension loading, Pi
+   queues this call; it binds and composes provider registrations later.
 5. Pi composes that extension provider with the provider from `models.json` and stored authentication.
 6. For a selected model whose `model.api` equals the registered extension `api`, Pi invokes the
    rotator's provider-scoped `streamSimple`.
@@ -30,9 +31,15 @@ No global one-dispatcher-per-api layer, builtin stream capture, or private lifec
 part of this Pi package.
 
 A provider/api mismatch is security-relevant. Pi can fall through to a base or generic stream when
-`model.api !== registered api`, bypassing rotation. Configuration, registration, model selection,
-and `/key-rotator doctor` must treat a managed provider with the wrong api as a failure. Keep the
-`api` value in `key-rotator.json` equal to the provider's `api` in `<agent dir>/models.json`.
+`model.api !== registered api`, bypassing rotation. Keep the `api` value in `key-rotator.json` equal
+to the provider's `api` in `<agent dir>/models.json`. The model-selection warning and `doctor` output
+are local diagnostics, not a request fence or proof of the final host composition.
+
+Pi 0.84.2 also merges a later registration for the same provider over fields from an earlier one. It
+does not definitively reject duplicate provider registrations. Load order can therefore replace the
+rotator's stream. The real-host suite must cover both an API mismatch and a later competing
+registration with stored `auth.json` credentials; a safe result makes no authenticated physical
+request and consumes no pool attempt.
 
 ## 3. Base stream
 
@@ -119,10 +126,12 @@ to terminate the process tree, but detached descendants can survive.
 
 ## 10. Doctor boundary
 
-`/key-rotator doctor` is read-only and sends no provider request. It checks local config/state/path
-safety and the registered provider/api contract that Pi exposes. It cannot validate credentials,
-quota, Windows ACLs, every adapter's diagnostic behavior, hard-link mutation without writing, or Pi's
-future retry classification.
+`/key-rotator doctor` is read-only and sends no provider request. Its target check compares config
+with the provider/api pairs captured immediately after this extension made its own local registration
+calls. It does not query Pi's final composed provider, confirm that queued registration later bound,
+or detect a later/duplicate winner. It also cannot validate credentials, quota, Windows ACLs, every
+adapter's diagnostic behavior, hard-link mutation without writing, or Pi's future retry
+classification.
 
 ## 11. Package and module resolution
 

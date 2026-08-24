@@ -12,10 +12,13 @@ boundary ends.
 | literal `value` | `{ "id": "k1", "value": "sk-REPLACE-ME-1" }` | simplest; reliable for GUI/daemon launches | plaintext at rest; easy to copy, back up, sync, or commit |
 | `env` | `{ "id": "k1", "env": "MY_KEY_1" }` | config has only an environment name | process must inherit it; environment and shell files are still readable to the same user |
 | external `command` | `{ "id": "k1", "command": "op read op://Private/ai/k1" }` | no raw secret in rotator config; can use an unlock policy | trusted shell execution and one process spawn per key at load |
-| Pi `auth.json` | one value per provider | existing Pi credential store | cannot express this rotation pool; only participates in host preflight |
+| Pi `auth.json` | one value per provider | existing Pi credential store | cannot express this rotation pool; Pi can resolve it before stream composition, so mismatch/competing-registration paths must be fenced |
 
 Recommended order is a trusted vault/keychain `command`, then `env`, then a literal `value`. All
-resolved values stay in process memory for the extension lifetime.
+resolved values stay in process memory for the extension lifetime. Packaged samples are linked from
+the [README quick start](../README.md#5-quick-start), including the
+[environment](../examples/key-rotator.env.example.json) and
+[command](../examples/key-rotator.command.example.json) forms.
 
 The provider registry never receives a configured pool secret. It receives the inert non-empty
 fallback `rotator-managed-key` for every managed provider. The rotating stream replaces the attempt

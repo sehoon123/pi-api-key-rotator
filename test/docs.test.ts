@@ -67,3 +67,33 @@ test("relative Markdown links resolve inside the repository", async () => {
     }
   }
 });
+
+
+test("quick start uses a reachable pinned example and documents real path/environment behavior", async () => {
+  const english = await text("README.md");
+  const korean = await text("README.ko.md");
+  for (const contents of [english, korean]) {
+    assert.doesNotMatch(contents, /cp examples\//u);
+    assert.match(
+      contents,
+      /raw\.githubusercontent\.com\/sehoon123\/pi-api-key-rotator\/v0\.4\.0\/examples\/key-rotator\.literal\.example\.json/u,
+    );
+    assert.match(contents, /\[.*key-rotator\.env\.example\.json.*\]\(examples\/key-rotator\.env\.example\.json\)/u);
+    assert.match(contents, /PI_KEY_ROTATOR_CONFIG/);
+    assert.match(contents, /working directory/u);
+    assert.match(contents, /<agent dir>\/models\.json/u);
+  }
+  const auditedPaths = markdownFiles.filter((path) => path !== "SECURITY.md");
+  assert.doesNotMatch((await Promise.all(auditedPaths.map(text))).join("\n"), /explicit loader (?:option|path)/u);
+});
+
+test("doctor and duplicate-registration claims stay within what Pi 0.84.2 proves", async () => {
+  const english = await text("README.md");
+  const internals = await text("docs/PI_INTERNALS.md");
+  const changelog = await text("CHANGELOG.md");
+  assert.match(english, /does not inspect Pi's final composed provider/u);
+  assert.match(english, /may merge a later registration instead of rejecting it/u);
+  assert.match(internals, /does not definitively reject duplicate provider registrations/u);
+  assert.match(internals, /does not query Pi's final composed provider/u);
+  assert.match(changelog, /does not confirm Pi's final composed\s+provider/u);
+});

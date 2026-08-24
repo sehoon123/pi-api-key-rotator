@@ -7,8 +7,10 @@ All notable release-facing changes are documented here.
 ### Compatibility and packaging
 
 - Targets Pi `0.84.2`, its matching `@earendil-works/pi-ai`, and Node.js `>=22.19.0`.
-- Adds `PI_CODING_AGENT_DIR` support for default config and state paths. Precedence is explicit loader
-  option, `PI_KEY_ROTATOR_CONFIG`, `PI_CODING_AGENT_DIR`, then `~/.pi/agent`.
+- Adds `PI_CODING_AGENT_DIR` support for default config and state paths. The package entry uses
+  `PI_KEY_ROTATOR_CONFIG` for the config when set; otherwise it uses
+  `<PI_CODING_AGENT_DIR>/key-rotator.json` or `~/.pi/agent/key-rotator.json`. The config override does
+  not move default state files.
 - Keeps Pi core modules as wildcard peers, as required by Pi package loading, while pinning exact
   `0.84.2` development and contract-test copies in a tracked lockfile.
 - Adds Ubuntu/Windows × Node 22.19/24 CI, coverage thresholds, packed-install smoke, and a pinned real
@@ -50,8 +52,9 @@ All notable release-facing changes are documented here.
 - `rateLimitScope: "key" | "target" | "pool"`, default `"key"`, for `cooldownStatuses`.
 - `targetFailureThreshold`, default `2`, with per-target consecutive-failure, cooldown, status,
   timestamp, and ordered-outcome state.
-- `/key-rotator doctor`, which sends no provider request and reports local config/state safety and
-  managed provider/api consistency.
+- `/key-rotator doctor`, which sends no provider request and reports local config/state safety plus
+  the provider/api pairs submitted by this extension. It does not confirm Pi's final composed
+  provider or detect a later competing registration.
 - `maxStateFileBytes` dynamic minimum sized for a worst-case state v2 object and rolling-config
   overlap.
 - Physical path collision detection across config, state, `.lock`, `.lock.reclaim`, and `.bak`,
@@ -107,6 +110,9 @@ All notable release-facing changes are documented here.
 - Pi 0.84.2 agent-level retry is a separate budget. This package assumes no private host lifecycle marker. Set Pi `retry.enabled` to `false` when a strict whole-turn ceiling is required.
 - Provider registration is Pi provider-scoped. A managed provider/api mismatch is a failure because
   Pi can otherwise bypass the wrapper.
+- Pi 0.84.2 may merge a later registration for the same provider instead of rejecting it. The real-host
+  security contract therefore covers both API mismatch and competing-registration paths with stored
+  `auth.json` credentials; local doctor output alone does not establish the winning stream.
 
 ### Lock, backup, and crash behavior
 
@@ -195,8 +201,10 @@ fresh state. This intentionally loses counters, circuits, cooldowns, and disable
 
 #### 5. Verify
 
-Run `/reload`, `/key-rotator doctor`, and `/key-rotator status`. Make one controlled provider request
-only after doctor no longer reports state/path failure.
+Run `/reload`, `/key-rotator doctor`, and `/key-rotator status`. Doctor reports only local checks; it
+does not confirm the final host provider composition. Inspect Pi startup diagnostics, remove duplicate
+registrations, and make one controlled provider request only after doctor no longer reports a
+state/path failure.
 
 ## [0.3.0] - 2026-08-19
 

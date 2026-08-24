@@ -61,7 +61,7 @@ Pin the reviewed release:
 pi install git:github.com/sehoon123/pi-api-key-rotator@v0.4.0
 ```
 
-Then run inside a session:
+After creating the config in [Quick start](#5-quick-start), run inside a session:
 
 ```text
 /reload
@@ -112,27 +112,42 @@ See [CHANGELOG.md](CHANGELOG.md) for all behavior changes and recovery details.
 
 ## 5. Quick start
 
+The install command does not put the examples in your current working directory. Download the pinned
+example instead. Use absolute values if `PI_CODING_AGENT_DIR` or `PI_KEY_ROTATOR_CONFIG` is set.
+
 ```bash
+umask 077
 agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-mkdir -p "$agent_dir"
-cp examples/key-rotator.literal.example.json "$agent_dir/key-rotator.json"
-chmod 600 "$agent_dir/key-rotator.json"
-# Replace every sk-REPLACE-ME-* placeholder with a real key.
+config_file="${PI_KEY_ROTATOR_CONFIG:-$agent_dir/key-rotator.json}"
+mkdir -p "$(dirname "$config_file")"
+curl --fail --location \
+  https://raw.githubusercontent.com/sehoon123/pi-api-key-rotator/v0.4.0/examples/key-rotator.literal.example.json \
+  --output "$config_file"
+chmod 600 "$config_file"
+# In "$config_file", match provider/api to <agent dir>/models.json and
+# replace every sk-REPLACE-ME-* placeholder with a real key.
 ```
 
-The default `<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. Config
-path precedence is an explicit loader option, `PI_KEY_ROTATOR_CONFIG`, then
-`<agent dir>/key-rotator.json`.
+The package entry reads `PI_KEY_ROTATOR_CONFIG` when it is set. Otherwise it reads
+`<agent dir>/key-rotator.json`, where `<agent dir>` is `$PI_CODING_AGENT_DIR` when set and
+`~/.pi/agent` otherwise. A relative override is resolved from the Pi process working directory, so
+use an absolute path. `PI_KEY_ROTATOR_CONFIG` changes only the config path. It does not change the Pi
+agent directory or the default state-file directory.
+
+The example provider ids and `api` values are placeholders. They do not create a provider or model.
+Match them exactly to an existing entry in `<agent dir>/models.json` before `/reload`. For an `env`
+example, export every named variable in the environment that starts the Pi process. A variable set in
+another terminal is not imported by `/reload`.
 
 Other examples:
 
 | File | Shape |
 |---|---|
-| `examples/key-rotator.env.example.json` | one pool, environment sources |
-| `examples/key-rotator.literal.example.json` | one pool, placeholder literal sources |
-| `examples/key-rotator.command.example.json` | one pool, vault/keychain commands |
-| `examples/key-rotator.multi-pool.example.json` | two independent pools |
-| `examples/key-rotator.ibm-ica.example.json` | one shared pool with two Pi provider targets |
+| [`examples/key-rotator.env.example.json`](examples/key-rotator.env.example.json) | one pool, environment sources |
+| [`examples/key-rotator.literal.example.json`](examples/key-rotator.literal.example.json) | one pool, placeholder literal sources |
+| [`examples/key-rotator.command.example.json`](examples/key-rotator.command.example.json) | one pool, vault/keychain commands |
+| [`examples/key-rotator.multi-pool.example.json`](examples/key-rotator.multi-pool.example.json) | two independent pools |
+| [`examples/key-rotator.ibm-ica.example.json`](examples/key-rotator.ibm-ica.example.json) | one shared pool with two Pi provider targets |
 
 The editor schema is [`docs/key-rotator.schema.json`](docs/key-rotator.schema.json). Configure that
 path in the editor. Do **not** add a `$schema` property to `key-rotator.json`; runtime validation
@@ -281,10 +296,12 @@ With several pools, a bare `next` or `reset` uses the pool for the selected mode
 inferred. Otherwise it refuses and asks for a pool id or `all`.
 
 `doctor` checks config metadata, state size/ownership/mode/readability, parent writability, strict
-read-only state parsing, and managed provider/api consistency. It reports `OK`, `WARN`, or `FAIL`. It
-does not call a provider, validate credentials or quota, inspect Windows ACLs, prove every adapter's
-failure shape, or prove hard-link support without a mutation. If config loading failed, the disabled
-`/key-rotator` command shows that load error; the full doctor is not available yet.
+read-only state parsing, and the provider/api pairs that this extension locally submitted for
+registration. It reports `OK`, `WARN`, or `FAIL`. It does not inspect Pi's final composed provider,
+detect a later or duplicate registration, or prove that the host will call the rotator stream. It
+also does not call a provider, validate credentials or quota, inspect Windows ACLs, prove every
+adapter's failure shape, or prove hard-link support without a mutation. If config loading failed, the
+disabled `/key-rotator` command shows that load error; the full doctor is not available yet.
 
 ## 10. State v2, locks, and fail-closed behavior
 
@@ -391,7 +408,8 @@ zero and review the separate agent-level retry setting.
 
 | Symptom | Cause and fix |
 |---|---|
-| footer says `keys: disabled` | config/registration failed or a duplicate copy was loaded; run `/key-rotator` for the load error |
+| footer says `keys: disabled` | local config or startup failed; run `/key-rotator` for the captured load error |
+| duplicate extension/provider registration | Pi 0.84.2 may merge a later registration instead of rejecting it; remove duplicate copies and do not treat `doctor` as proof of the winning stream |
 | managed provider sends an unrotated fallback | the selected model api does not match the target api, or another registration won; stop and fix the provider/api contract |
 | `No rotation entry is currently available (...)` | key, target, or pool scope is unavailable; inspect status |
 | `Credential failover exhausted N attempt(s)` | wrapper budget ended or a target/pool circuit stopped selection; Pi may still have an outer retry |

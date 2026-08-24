@@ -38,7 +38,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - **Pi `0.84.2`**와 matching `@earendil-works/pi-ai`. v0.4.0이 검증한 host contract입니다.
 - **Node.js `>=22.19.0`**.
 - pool마다 독립적으로 사용할 수 있는 API key 2개 이상.
-- 각 provider가 `~/.pi/agent/models.json`에 이미 있어야 하며 `api` 값이 이 config와 정확히 같아야 합니다.
+- 각 provider가 `<agent dir>/models.json`에 이미 있어야 하며 `api` 값이 이 config와 정확히 같아야 합니다.
+  `<agent dir>`은 `PI_CODING_AGENT_DIR`가 설정되어 있으면 그 값이고, 아니면 `~/.pi/agent`입니다.
   api mismatch에서는 Pi가 extension stream을 bypass할 수 있습니다.
 - state directory의 filesystem이 atomic hard link를 지원해야 합니다.
 
@@ -60,7 +61,7 @@ Pi에는 extension 밖의 agent-level retry budget도 있습니다. `maxAttempts
 pi install git:github.com/sehoon123/pi-api-key-rotator@v0.4.0
 ```
 
-session 안에서 다음을 실행합니다.
+[빠른 시작](#5-빠른-시작)에서 config를 만든 뒤 session 안에서 다음을 실행합니다.
 
 ```text
 /reload
@@ -110,27 +111,42 @@ pin하지 않은 설치는 이후 credential을 읽을 수 있는 코드까지 �
 
 ## 5. 빠른 시작
 
+install command는 현재 working directory에 example을 만들지 않습니다. 따라서 고정된 release의 example을
+직접 download하세요. `PI_CODING_AGENT_DIR` 또는 `PI_KEY_ROTATOR_CONFIG`를 설정했다면 absolute path를
+사용하세요.
+
 ```bash
+umask 077
 agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-mkdir -p "$agent_dir"
-cp examples/key-rotator.literal.example.json "$agent_dir/key-rotator.json"
-chmod 600 "$agent_dir/key-rotator.json"
+config_file="${PI_KEY_ROTATOR_CONFIG:-$agent_dir/key-rotator.json}"
+mkdir -p "$(dirname "$config_file")"
+curl --fail --location \
+  https://raw.githubusercontent.com/sehoon123/pi-api-key-rotator/v0.4.0/examples/key-rotator.literal.example.json \
+  --output "$config_file"
+chmod 600 "$config_file"
+# "$config_file"의 provider/api를 <agent dir>/models.json과 일치시키고
 # 모든 sk-REPLACE-ME-* placeholder를 실제 key로 바꾸세요.
 ```
 
-기본 `<agent dir>`은 `PI_CODING_AGENT_DIR`가 설정되어 있으면 그 값이고, 아니면
-`~/.pi/agent`입니다. config path precedence는 explicit loader option, `PI_KEY_ROTATOR_CONFIG`,
-`<agent dir>/key-rotator.json` 순서입니다.
+package entry는 `PI_KEY_ROTATOR_CONFIG`가 설정되어 있으면 그 config를 읽습니다. 설정되어 있지 않으면
+`<agent dir>/key-rotator.json`을 읽습니다. 여기서 `<agent dir>`은 `PI_CODING_AGENT_DIR`가 설정되어 있으면
+그 값이고, 아니면 `~/.pi/agent`입니다. relative override는 Pi process의 working directory를 기준으로
+resolve하므로 absolute path를 권장합니다. `PI_KEY_ROTATOR_CONFIG`는 config path만 바꾸며 Pi agent
+directory나 default state-file directory를 바꾸지 않습니다.
+
+example의 provider id와 `api` 값은 placeholder이며 provider/model을 생성하지 않습니다. `/reload` 전에
+`<agent dir>/models.json`의 기존 항목과 정확히 일치시키세요. `env` example을 쓰면 Pi process를 시작하는
+environment에 모든 변수를 export해야 합니다. 다른 terminal에 설정한 변수는 `/reload`가 가져오지 않습니다.
 
 다른 example:
 
 | File | 형태 |
 |---|---|
-| `examples/key-rotator.env.example.json` | pool 1개, environment source |
-| `examples/key-rotator.literal.example.json` | pool 1개, placeholder literal source |
-| `examples/key-rotator.command.example.json` | pool 1개, vault/keychain command |
-| `examples/key-rotator.multi-pool.example.json` | 독립 pool 2개 |
-| `examples/key-rotator.ibm-ica.example.json` | Pi provider target 2개가 공유하는 pool 1개 |
+| [`examples/key-rotator.env.example.json`](examples/key-rotator.env.example.json) | pool 1개, environment source |
+| [`examples/key-rotator.literal.example.json`](examples/key-rotator.literal.example.json) | pool 1개, placeholder literal source |
+| [`examples/key-rotator.command.example.json`](examples/key-rotator.command.example.json) | pool 1개, vault/keychain command |
+| [`examples/key-rotator.multi-pool.example.json`](examples/key-rotator.multi-pool.example.json) | 독립 pool 2개 |
+| [`examples/key-rotator.ibm-ica.example.json`](examples/key-rotator.ibm-ica.example.json) | Pi provider target 2개가 공유하는 pool 1개 |
 
 editor schema는 [`docs/key-rotator.schema.json`](docs/key-rotator.schema.json)입니다. editor 설정에서
 이 경로를 지정하세요. `key-rotator.json`에 `$schema` property를 추가하면 안 됩니다. runtime은 unknown
@@ -275,10 +291,11 @@ pool이 여러 개이면 인자 없는 `next`/`reset`은 선택된 model의 pool
 추론할 수 없으면 거부하고 pool id 또는 `all`을 요구합니다.
 
 `doctor`는 config metadata, state size/ownership/mode/readability, parent writability, strict read-only state
-parse, managed provider/api consistency를 확인하고 `OK`, `WARN`, `FAIL`을 보고합니다. provider를 호출하거나
-credential/quota를 검증하지 않으며 Windows ACL, 모든 adapter failure shape, mutation 없는 hard-link 지원을
-증명하지 않습니다. config load 자체가 실패하면 disabled `/key-rotator`가 load error를 표시하며 full doctor는
-아직 사용할 수 없습니다.
+parse, 그리고 이 extension이 local registration에 제출한 provider/api pair를 확인하여 `OK`, `WARN`, `FAIL`을
+보고합니다. Pi가 최종 compose한 provider를 검사하거나, 나중 또는 duplicate registration을 발견하거나, host가
+rotator stream을 호출할 것을 증명하지는 않습니다. 또한 provider를 호출하거나 credential/quota를 검증하지
+않으며 Windows ACL, 모든 adapter failure shape, mutation 없는 hard-link 지원을 증명하지 않습니다. config
+load 자체가 실패하면 disabled `/key-rotator`가 load error를 표시하며 full doctor는 아직 사용할 수 없습니다.
 
 ## 10. State v2, lock, fail-closed 동작
 
@@ -393,7 +410,8 @@ upstream log를 보호하고 credential을 다룰 때 provider debug logging을 
 
 | 증상 | 원인과 해결 |
 |---|---|
-| footer가 `keys: disabled` | config/registration 실패 또는 duplicate copy. `/key-rotator`에서 load error 확인. |
+| footer가 `keys: disabled` | local config 또는 startup 실패. `/key-rotator`에서 기록된 load error 확인. |
+| duplicate extension/provider registration | Pi 0.84.2는 later registration을 거부하지 않고 merge할 수 있음. duplicate copy를 제거하고 `doctor`를 winning stream의 증명으로 보지 말 것. |
 | managed provider가 rotation 없이 fallback 전송 | selected model api와 target api가 다르거나 다른 registration이 이김. 즉시 provider/api contract 수정. |
 | `No rotation entry is currently available (...)` | key, target, pool scope 중 하나가 unavailable. status 확인. |
 | `Credential failover exhausted N attempt(s)` | wrapper budget 소진 또는 target/pool circuit 중단. Pi outer retry는 별도일 수 있음. |

@@ -2,7 +2,10 @@
 
 `<agent dir>/key-rotator.json` accepts one pool object or a top-level `pools[]` document. This guide
 explains sharing boundaries in v0.4.0.
-`<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`.
+`<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. Ready-to-copy
+placeholders are the [shared IBM ICA example](../examples/key-rotator.ibm-ica.example.json) and the
+[independent multi-pool example](../examples/key-rotator.multi-pool.example.json). Their provider ids
+must already exist with matching `api` values in `<agent dir>/models.json`.
 
 ## 1. One pool with several targets
 
@@ -140,7 +143,8 @@ run.
 - Top-level `pools` cannot coexist with any pool field.
 - There are at most 128 pools, 128 targets per pool, and 256 keys per pool.
 - Pool ids are unique case-insensitively.
-- Provider ids are unique inside one pool and across independent pools.
+- Provider ids are unique inside this rotator config, both within one pool and across independent
+  pools. This does not detect another Pi extension registering the same provider.
 - Every pool needs at least two keys, with unique ids and resolved values.
 - The config and every state, lock, reclaim, and backup artifact must have a unique lexical and
   physical location.
