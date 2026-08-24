@@ -1,6 +1,6 @@
 {
   "name": "pi-api-key-rotator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A Pi extension that runs independent API-key rotation pools for multiple provider endpoints.",
   "type": "module",
   "license": "MIT",
@@ -34,16 +34,19 @@
   },
   "files": [
     "src",
+    "docs",
+    "examples",
     "README.md",
-    "MULTI_POOL.md",
-    "LICENSE",
-    "config.example.json",
-    "config.literal.example.json",
-    "config.ibm-ica.example.json",
-    "config.multi-pool.example.json"
+    "README.ko.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:coverage": "node --experimental-strip-types --test --experimental-test-coverage --test-coverage-include=src/**/*.ts --test-coverage-lines=85 --test-coverage-branches=70 --test-coverage-functions=80 test/*.test.ts",
+    "test:package": "node test/package-smoke.integration.mjs",
+    "test:host": "node --experimental-strip-types --test test/actual-host.integration.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check": "npm run typecheck && npm test"
   },
@@ -52,9 +55,9 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.84.2",
-    "@earendil-works/pi-coding-agent": "^0.84.2",
-    "@types/node": "^24.0.0",
-    "typescript": "^5.9.3"
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "22.19.0",
+    "typescript": "5.9.3"
   }
 }

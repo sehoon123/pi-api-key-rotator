@@ -10,14 +10,56 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node-version: [22.19.0, 24.x]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      - run: npm install
+          cache: npm
+
+      # Pi normally installs git packages without development dependencies.
+      # This must succeed before the exact locked test toolchain is installed.
+      - run: npm ci --omit=dev
+      - run: npm ci --include=dev
       - run: npm run check
+      - name: Stress cross-process state locking on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($attempt in 1..4) {
+            Write-Host "Cross-process lock stress attempt $attempt"
+            node --experimental-strip-types --test --test-name-pattern "spawned writers do not lose updates" test/state-store-process.test.ts
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - run: npm run test:package
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci --include=dev
+      - run: npm run test:coverage
+
+  pi-0_84_2-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci --include=dev
+      - name: Verify the pinned Pi development host
+        run: npm ls --depth=0 @earendil-works/pi-ai@0.84.2 @earendil-works/pi-coding-agent@0.84.2
+      - run: npm run test:host

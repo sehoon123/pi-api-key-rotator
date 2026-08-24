@@ -8,20 +8,18 @@ dist/
 .env
 .env.*
 !.env.example
-key-rotator.json
-**/key-rotator.json
-key-rotator.local.json
-**/key-rotator.local.json
-config.literal.local.json
-**/config.literal.local.json
-config.ibm-ica.local.json
-**/config.ibm-ica.local.json
+config*.json
+**/config*.json
+key-rotator*.json
+**/key-rotator*.json
+!examples/key-rotator.*.example.json
+!docs/key-rotator.schema.json
 *.secrets.json
 **/*.secrets.json
 
-# Runtime state
+# Runtime state, backups, locks, reclaim claims, and candidates
 *.state.json
-*.state.json.lock
+*.state.json.*
 
 .DS_Store
 Thumbs.db

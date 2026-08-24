@@ -1,274 +1,433 @@
 # pi-api-key-rotator
 
-하나의 API-key pool을 Pi의 하나 또는 여러 provider에 공유하는 TypeScript extension입니다.
+한국어 문서: [README.ko.md](README.ko.md)
 
-Pi가 실제로 수행한 **provider 요청 횟수**를 기준으로 key를 회전합니다. 한 agent turn에서 tool call이 여러 번 발생하면 provider 요청도 여러 번 발생할 수 있으며, 각 요청이 rotation counter에 반영됩니다.
+A [Pi](https://github.com/earendil-works/pi) extension that owns one or more pools of
+interchangeable API credentials. It selects a key for each **rotator-controlled provider attempt**,
+can fail over before semantic output starts, and keeps shared state across sessions and processes.
 
-## 주요 기능
+The extension does not persist a raw secret. State v2 stores a SHA-256 credential identity so stale
+workers cannot apply an outcome to a replacement secret. Error data that reaches the wrapper is
+bounded and redacted. Upstream adapters, SDK logs, and Pi's separate agent-level retry are outside
+that boundary; see [Known upstream limits](#12-known-upstream-limits).
 
-- 하나 또는 여러 Pi provider/API target 지원
-- 여러 target이 동일한 key pool, counter, cooldown, disabled state를 공유
-- 기존 단일 `provider`/`api` 설정과 하위 호환
-- 환경변수 기반 key와 JSON에 직접 입력한 literal key 지원
-- key 하나를 `requestsPerKey`회 사용한 뒤 다음 key로 순환
-- `429` 발생 시 `Retry-After` 기반 cooldown 후 다음 key로 failover
-- `401`, `402`, `403` 발생 시 해당 key를 비활성화하고 다음 key로 failover
-- `408`, `409`, `425`, `5xx`, HTTP 응답 전 network failure에 제한적 failover
-- SDK 내부 retry를 `0`으로 설정하고 extension이 key 단위 retry를 제어
-- 여러 Pi process가 동일 state를 사용할 때 file lock과 atomic write 적용
-- API key를 state, status, footer, error log에 기록하지 않음
-- malformed JSON 및 validation error에서 literal key 노출 방지
-
-## 설치
-
-```bash
-pi install git:github.com/sehoon123/pi-api-key-rotator
+```text
+footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 ```
 
-이미 설치했다면 다음 명령으로 갱신합니다.
+## 1. What v0.4.0 does
+
+- Rotates after `requestsPerKey` selected attempts.
+- Tries at most `maxAttemptsPerRequest` distinct keys for one logical wrapper request. The default is
+  `min(keys.length, 3)`.
+- Disables a credential on `401/402/403` by default when a supported adapter exposes that status.
+- Applies a classified `429` cooldown at `key`, `target`, or `pool` scope.
+- Treats retryable transient HTTP and network failures as target health failures. A target circuit
+  opens after `targetFailureThreshold` consecutive failures.
+- Buffers only non-semantic stream structure. It never fails over after text, thinking, or tool-call
+  content becomes visible.
+- Holds the final provider terminal until the outcome state transaction commits.
+- Uses state v2 generation and credential-identity fences to ignore stale reset and rolling-config
+  completions.
+- Uses atomic replacement, a previous-version backup, and cross-process hard-link locks.
+- Refuses corrupt, wrong-pool, oversized, or unsafe state instead of silently resetting it.
+- Adds command-backed secret sources and `/key-rotator doctor` for read-only local checks.
+
+## 2. Requirements and compatibility
+
+- **Pi `0.84.2`** and its matching `@earendil-works/pi-ai`. This is the verified host contract for
+  v0.4.0.
+- **Node.js `>=22.19.0`**.
+- At least two independently usable API keys per pool.
+- Each provider must already exist in `<agent dir>/models.json`. Its `api` must exactly match this
+  config; Pi can bypass the extension stream on an api mismatch.
+- The state directory must be on a filesystem that supports atomic hard links.
+
+Pi's provider composition, adapter events, and retry classification are version-specific. Review
+[docs/PI_INTERNALS.md](docs/PI_INTERNALS.md) before using another Pi version.
+
+Pi also has an agent-level retry budget outside this extension. `maxAttemptsPerRequest` limits one
+wrapper invocation, not the whole agent turn. Set `retry.enabled` to `false` in Pi settings if a
+strict whole-turn ceiling is required. Keep `retry.provider.maxRetries` at `0`.
+
+> **More keys do not necessarily add quota.** Keys from one account, project, or organization often
+> share one quota bucket. Check the provider policy first.
+
+## 3. Install, update, and remove
+
+Pin the reviewed release:
 
 ```bash
-pi update --extensions
+pi install git:github.com/sehoon123/pi-api-key-rotator@v0.4.0
 ```
 
-설정 또는 package를 변경한 뒤 Pi를 다시 시작하거나 다음 명령을 실행합니다.
+Then run inside a session:
 
 ```text
 /reload
-```
-
-요구 사항:
-
-- Pi `0.84.2` 이상 권장
-- Node.js `22.19.0` 이상
-- `~/.pi/agent/models.json`에 등록된 API-key 기반 provider
-- 서로 독립적으로 사용할 수 있는 API key 2개 이상
-
-> 같은 account, project 또는 organization의 key들이 하나의 quota bucket을 공유한다면 key 개수만 늘려도 총 quota는 증가하지 않습니다. provider의 quota 정책을 먼저 확인하세요.
-
-## IBM ICA: Claude와 OpenAI-compatible provider를 함께 사용
-
-사용자가 제시한 `models.json`에는 다음 두 provider가 있습니다.
-
-| Provider ID | API type | Endpoint |
-|---|---|---|
-| `ibm-ica-claude` | `anthropic-messages` | `https://api.nextgen-beta.ica.ibm.com/ica` |
-| `ibm-ica` | `openai-completions` | `https://api.nextgen-beta.ica.ibm.com/ica/v1` |
-
-기존 `models.json`의 model 목록과 endpoint는 그대로 유지합니다. 이 extension은 각 provider를 같은 ID로 감싸고 실제 요청의 `apiKey`만 shared pool에서 선택한 값으로 덮어씁니다.
-
-`config.ibm-ica.example.json`을 다음 위치로 복사합니다.
-
-Linux/macOS:
-
-```bash
-cp config.ibm-ica.example.json ~/.pi/agent/key-rotator.json
-chmod 600 ~/.pi/agent/key-rotator.json
-```
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .\config.ibm-ica.example.json "$HOME\.pi\agent\key-rotator.json"
-```
-
-설정 예시:
-
-```json
-{
-  "poolId": "ibm-ica-shared",
-  "targets": [
-    {
-      "provider": "ibm-ica-claude",
-      "api": "anthropic-messages"
-    },
-    {
-      "provider": "ibm-ica",
-      "api": "openai-completions"
-    }
-  ],
-  "keys": [
-    { "id": "ica-key-1", "value": "REPLACE_WITH_ICA_API_KEY_1" },
-    { "id": "ica-key-2", "value": "REPLACE_WITH_ICA_API_KEY_2" },
-    { "id": "ica-key-3", "value": "REPLACE_WITH_ICA_API_KEY_3" }
-  ],
-  "requestsPerKey": 20,
-  "maxAttemptsPerRequest": 3,
-  "cooldownMs": 60000,
-  "transientCooldownMs": 5000,
-  "maxRetryAfterMs": 900000,
-  "retryStatuses": [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504],
-  "disableStatuses": [401, 402, 403],
-  "cooldownStatuses": [429],
-  "retryNetworkErrors": true,
-  "lockTimeoutMs": 5000,
-  "staleLockMs": 30000
-}
-```
-
-placeholder를 실제 key로 바꾼 뒤 Pi에서 확인합니다.
-
-```text
-/reload
+/key-rotator doctor
 /key-rotator status
 ```
 
-### Shared pool의 의미
-
-`requestsPerKey`가 `20`이면 두 provider의 요청 수를 합산합니다.
-
-```text
-key-1으로 Claude 요청 12회
-key-1으로 GPT 요청     7회
-key-1으로 Claude 요청  1회  ← 총 20회
-다음 요청부터 key-2 사용
-```
-
-한 provider에서 key가 `401` 또는 `403`으로 실패하면 동일한 credential은 shared pool 전체에서 비활성화됩니다. `429` cooldown도 두 provider가 공유합니다. 같은 ICA credential이 두 endpoint에서 공통으로 유효하고 quota도 공유되는 환경에 적합합니다.
-
-## 환경변수 방식
-
-JSON에 평문 key를 넣지 않으려면 다음처럼 설정합니다.
-
-```json
-{
-  "poolId": "ibm-ica-shared",
-  "targets": [
-    { "provider": "ibm-ica-claude", "api": "anthropic-messages" },
-    { "provider": "ibm-ica", "api": "openai-completions" }
-  ],
-  "keys": [
-    { "id": "ica-key-1", "env": "IBM_ICA_API_KEY_1" },
-    { "id": "ica-key-2", "env": "IBM_ICA_API_KEY_2" },
-    { "id": "ica-key-3", "env": "IBM_ICA_API_KEY_3" }
-  ],
-  "requestsPerKey": 20
-}
-```
-
-Bash/Zsh:
+A pinned source does not move to a new tag when `pi update --extensions` runs. To adopt a later
+reviewed release, install that new ref explicitly:
 
 ```bash
-export IBM_ICA_API_KEY_1="..."
-export IBM_ICA_API_KEY_2="..."
-export IBM_ICA_API_KEY_3="..."
+pi install git:github.com/sehoon123/pi-api-key-rotator@vNEXT
 ```
 
-PowerShell:
+`pi update --extensions` can reconcile the already selected ref. Remove the package with `pi remove`
+using the source shown in Pi settings.
 
-```powershell
-$env:IBM_ICA_API_KEY_1 = "..."
-$env:IBM_ICA_API_KEY_2 = "..."
-$env:IBM_ICA_API_KEY_3 = "..."
+An unpinned install tracks future code that can read credentials. Re-review every update. Never keep
+a real config, state file, or local edit inside Pi's installed package clone. Git-package
+reconciliation can reset and clean that clone.
+
+## 4. Upgrade from v0.1-v0.3
+
+This is a quiescent state upgrade:
+
+1. Stop every Pi session and process that can write these state files.
+2. Copy each state file and any existing sidecars to a private backup directory.
+3. Remove any duplicate vendored/local copy of the extension.
+4. Install the v0.4.0 tag and run `/reload`.
+5. Run `/key-rotator doctor`, then `/key-rotator status` for every pool.
+
+Valid Pi v1 state is normalized in memory and written as Pi state v2 on the next mutation. The
+filename stays `key-rotator-<poolId>.state.json`. Do not leave a v0.1-v0.3 process writing after
+v0.4 starts; old writers do not preserve generation, credential identity, target health, or the new
+lock protocol.
+
+Review these behavior changes before rollout:
+
+- An omitted `maxAttemptsPerRequest` no longer means every configured key. It means at most three.
+- Transient and network health is target-scoped, rather than a key-specific cooldown.
+- State and lock validation is stricter and fails closed.
+- Mutations require hard-link support.
+- A custom `maxStateFileBytes` must meet a new pool-specific minimum.
+- Packaged examples moved from root `config*.example.json` names to `examples/key-rotator.*.example.json`.
+- Pi agent-level retry remains a separate budget unless disabled in Pi settings.
+
+See [CHANGELOG.md](CHANGELOG.md) for all behavior changes and recovery details.
+
+## 5. Quick start
+
+```bash
+agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+mkdir -p "$agent_dir"
+cp examples/key-rotator.literal.example.json "$agent_dir/key-rotator.json"
+chmod 600 "$agent_dir/key-rotator.json"
+# Replace every sk-REPLACE-ME-* placeholder with a real key.
 ```
 
-각 key entry는 `env` 또는 `value` 중 **정확히 하나만** 가져야 합니다. 두 source를 같은 pool에서 혼합할 수도 있습니다.
+The default `<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. Config
+path precedence is an explicit loader option, `PI_KEY_ROTATOR_CONFIG`, then
+`<agent dir>/key-rotator.json`.
 
-## 기존 단일-provider 설정
+Other examples:
 
-기존 형식은 변경 없이 계속 지원합니다.
-
-```json
-{
-  "provider": "my-company-ai",
-  "api": "openai-completions",
-  "keys": [
-    { "id": "key-1", "env": "MY_API_KEY_1" },
-    { "id": "key-2", "env": "MY_API_KEY_2" }
-  ],
-  "requestsPerKey": 20
-}
-```
-
-다음 `targets` 형식과 동일한 의미입니다.
-
-```json
-{
-  "targets": [
-    { "provider": "my-company-ai", "api": "openai-completions" }
-  ],
-  "keys": [
-    { "id": "key-1", "env": "MY_API_KEY_1" },
-    { "id": "key-2", "env": "MY_API_KEY_2" }
-  ]
-}
-```
-
-`provider`/`api`와 `targets`를 동시에 지정하면 configuration error가 발생합니다. 동일한 provider ID를 `targets`에 두 번 등록하는 것도 차단합니다. Pi의 provider override는 provider ID 단위이므로 서로 다른 API adapter가 필요하면 `models.json`에서 각각 다른 provider ID를 사용해야 합니다.
-
-## 명령
-
-| 명령 | 설명 |
+| File | Shape |
 |---|---|
-| `/key-rotator` | `status`와 동일 |
-| `/key-rotator status` | pool, target 목록, key별 counter와 상태 표시 |
-| `/key-rotator next` | 다음 사용 가능한 key로 수동 이동 |
-| `/key-rotator reset` | counter, cooldown, disabled 상태 초기화 |
+| `examples/key-rotator.env.example.json` | one pool, environment sources |
+| `examples/key-rotator.literal.example.json` | one pool, placeholder literal sources |
+| `examples/key-rotator.command.example.json` | one pool, vault/keychain commands |
+| `examples/key-rotator.multi-pool.example.json` | two independent pools |
+| `examples/key-rotator.ibm-ica.example.json` | one shared pool with two Pi provider targets |
 
-`reset`은 인증 실패로 비활성화된 key도 다시 활성화합니다. credential 문제를 수정한 뒤 사용하세요.
+The editor schema is [`docs/key-rotator.schema.json`](docs/key-rotator.schema.json). Configure that
+path in the editor. Do **not** add a `$schema` property to `key-rotator.json`; runtime validation
+rejects unknown fields. Runtime validation is authoritative, including cross-field, physical-path,
+and dynamic-size checks that JSON Schema cannot express.
 
-## 기본 실패 정책
+## 6. Configuration reference
 
-| 상황 | 동작 |
+A document is either one pool object or `{ "pools": [<pool>, ...] }`. There can be at most 128 pools.
+`configVersion` is optional; when present it must be the integer `1` and appears only at the document
+root. Top-level `pools` cannot be combined with pool fields.
+
+| Field | Default | Runtime rules |
+|---|---|---|
+| `poolId` | sanitized first provider id | 1-64 chars matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; stable pool and state identity |
+| `targets[]` | multi-target form | 1-128 `{ provider, api }` objects; provider ids must be unique |
+| `provider` + `api` | legacy single-target form | use both together and never with `targets` |
+| `keys[]` | required | 2-256 entries; each has `id` and exactly one of `env`, `value`, or `command` |
+| `requestsPerKey` | `20` | 1-1,000,000 selected rotator attempts, summed across a shared pool |
+| `maxAttemptsPerRequest` | `min(keys.length, 3)` | 1-`keys.length`; distinct keys considered for one wrapper invocation |
+| `cooldownMs` | `60000` | 0-86,400,000 ms; fallback when `Retry-After` is missing or invalid |
+| `transientCooldownMs` | `5000` | 0-3,600,000 ms; target-circuit duration for transient/network failure |
+| `maxRetryAfterMs` | `900000` | 0-86,400,000 ms; `0` removes the configured cap, subject to safe-integer limits |
+| `retryStatuses` | `401,402,403,408,409,425,429,500,502,503,504` | non-empty; every status is 100-599 |
+| `disableStatuses` | `401,402,403` | may be empty; subset of `retryStatuses` |
+| `cooldownStatuses` | `429` | may be empty; subset of `retryStatuses` and disjoint from `disableStatuses` |
+| `rateLimitScope` | `"key"` | `"key"`, `"target"`, or `"pool"`; applies to `cooldownStatuses` |
+| `targetFailureThreshold` | `2` | 1-100 consecutive transient/network failures before a target circuit opens |
+| `retryNetworkErrors` | `true` | controls same-request failover; target health still updates when false |
+| `stateFile` | `<agent dir>/key-rotator-<poolId>.state.json` | absolute, `~`-relative, or relative to the config directory; must not collide with another artifact |
+| `lockTimeoutMs` | `5000` | 100-60,000 ms |
+| `staleLockMs` | `30000` | 1,000-600,000 ms; a live owner is not reclaimed merely because it is old |
+| `maxStateFileBytes` | `1048576` | 1,024-16,777,216 bytes and at least the dynamic minimum below |
+
+Unknown fields are rejected. Pool ids are unique case-insensitively. A provider can belong to only
+one independent pool. `stateFile`, `.lock`, `.lock.reclaim`, and `.bak` locations must all be unique.
+Provider and api strings allow at most 256 characters; a state path allows at most 4,096.
+
+### Dynamic `maxStateFileBytes` minimum
+
+The loader computes a minimum from the UTF-8 serialized worst-case v2 record for the configured pool
+id, key ids, and target ids. It reserves room for current records plus a bounded maximum prior
+rolling-config generation (up to 256 unconfigured keys and 128 unconfigured targets), then adds 1,024
+bytes. The nominal 1,024-byte range minimum is therefore not enough for a real pool. If the configured
+value is too small, loading reports the exact required byte count. The configured limit is enforced
+before state is read or written.
+
+### Key sources and command limits
+
+| Source | Example | Notes |
+|---|---|---|
+| `env` | `{ "id": "k1", "env": "MY_KEY_1" }` | read from the Pi process environment; GUI launches may not inherit a shell profile |
+| `value` | `{ "id": "k1", "value": "sk-REPLACE-ME-1" }` | plaintext in config; keep the file private |
+| `command` | `{ "id": "k1", "command": "op read op://Private/ai/k1", "commandTimeoutMs": 10000 }` | runs once, sequentially, during load; trimmed stdout becomes the in-memory secret |
+
+Secret values must be well-formed Unicode and allow at most 65,536 UTF-16 code units and 131,072
+UTF-8 bytes. A command string allows 4,096 characters. `commandTimeoutMs` defaults to 10,000 and
+allows 100-120,000 ms. Across the document, at most 64 command-backed keys and 600,000 ms of configured
+timeout budget are allowed. Resolution also has a 600,000 ms aggregate startup deadline. Stdout is
+capped at 132,096 bytes; stderr is ignored. Output and rejection details are not copied into extension
+errors.
+
+Timeout or cancellation closes stdout and requests process-tree termination. On POSIX this sends
+`SIGKILL` to a detached process group. On Windows it tries `taskkill /T /F`, then direct termination.
+This is best effort: a command can create a detached child that survives. Configure only trusted,
+bounded commands. See [docs/SECRETS.md](docs/SECRETS.md).
+
+## 7. Shared pools, rate-limit scope, and target circuits
+
+A shared pool has several `targets`. Keys, selection counters, disabled credentials, and the current
+key are shared. Target circuit state is separate for each provider target.
+
+An independent `pools[]` entry has its own keys, policy, and state file. Two independent pools can use
+the same `api` type, but a provider id can belong to only one pool. See
+[docs/MULTI_POOL.md](docs/MULTI_POOL.md).
+
+`rateLimitScope` controls the blast radius of a status in `cooldownStatuses`:
+
+| Scope | On classified `429` by default | Availability |
+|---|---|---|
+| `key` | cool the selected credential for parsed `Retry-After` or `cooldownMs` | that credential stops on every shared target; other keys can continue |
+| `target` | open that provider target circuit immediately for the delay | other targets in the shared pool can continue |
+| `pool` | cool the entire pool immediately for the delay | no target or key in that pool can continue |
+
+For another classified retryable transient status, or a network failure, the selected key's failure
+counter is updated but the key is not cooled or disabled. The target's consecutive-failure count
+increases. At `targetFailureThreshold`, its circuit opens for `transientCooldownMs`. A newer success
+clears health for its key and target and clears an older pool cooldown. Attempt ordering prevents an
+older late failure from re-disabling that key or reopening the cleared scope.
+
+With the default threshold `2`, two consecutive target failures can stop a wrapper invocation before
+a third key is consumed. A target- or pool-scoped rate limit opens its scope immediately, so another
+key cannot continue against that unavailable scope in the same invocation.
+
+## 8. Stream and failure policy
+
+The actions below apply when the Pi adapter exposes a reliable HTTP status or supported structured
+failure. See [Known upstream limits](#12-known-upstream-limits) for adapters that do not.
+
+| Outcome before semantic output | Durable action | Same-wrapper failover |
+|---|---|---|
+| normal `2xx`/`3xx` terminal | success | no |
+| `disableStatuses` | disable selected credential | yes, if another key and scope are available |
+| `cooldownStatuses` | apply `rateLimitScope` delay | only if the selected scope remains available |
+| other `retryStatuses` | update target circuit | yes, until circuit/attempt budget stops it |
+| non-retry status such as `400` | record failure and forward final error | no |
+| network/stream failure without a response | update target circuit | when `retryNetworkErrors` is true |
+| caller callback failure | selected attempt remains counted; no health penalty | no |
+| caller abort | no disable/cooldown health penalty | no |
+
+Each selected attempt passes `maxRetries: 0` to the adapter. The extension's counters represent
+selected rotator attempts, not guaranteed physical network calls. Nested SDK behavior and Pi's outer
+agent-level retry can make more calls.
+
+### Semantic-event buffering
+
+Empty `start`, block structure, and other non-semantic events are buffered until real text, thinking,
+or tool-call content appears. An in-band retryable failure can discard only that pre-semantic
+structure. Unknown extension events are treated as semantic for compatibility.
+
+Once semantic content is forwarded, events use low-latency streaming and automatic failover stops. If
+the source then fails, the wrapper emits one terminal for that invocation instead of replaying the
+request and risking duplicate text or tool calls.
+
+### Durable terminal gate
+
+The final `done` or `error` event is held until the success/failure transaction commits to state. If
+that commit fails, the provider terminal is suppressed and an internal key-rotator error is sent. This
+does not buffer the whole response; semantic incremental events can already be visible.
+
+Pi 0.84.2 can independently retry a final provider-like error at the agent level. This package does not assume a private host lifecycle diagnostic. Disable Pi `retry.enabled` when a strict total
+attempt limit is required.
+
+## 9. Commands and doctor
+
+| Command | Effect |
 |---|---|
-| 정상 요청 | `requestsPerKey`회 실제 provider attempt 후 다음 key로 이동 |
-| `429` | `Retry-After` 우선, 없으면 `cooldownMs` 적용 후 다음 key로 재시도 |
-| `401`, `402`, `403` | 해당 key를 shared pool 전체에서 disabled 처리 |
-| `408`, `409`, `425`, `5xx` | `transientCooldownMs` 적용 후 다음 key로 제한적 재시도 |
-| HTTP 응답 전 network failure | 설정 시 짧은 cooldown 후 다음 key로 재시도 |
-| 정상 response stream이 시작된 뒤 오류 | 중복 tool/output 방지를 위해 failover하지 않음 |
-| 모든 key 실패 | secret을 제거한 terminal error 반환 |
+| `/key-rotator` | same as `status` |
+| `/key-rotator status [poolId]` | full status of all pools, or one pool |
+| `/key-rotator list` | one compact line per pool |
+| `/key-rotator doctor` | read-only local config, state, and provider/api checks; sends no request |
+| `/key-rotator next <poolId\|all>` | advance the current key |
+| `/key-rotator reset <poolId\|all>` | clear health/counters and increment the state generation |
 
-OpenAI/Anthropic SDK가 자체 retry를 먼저 수행하면 동일한 key가 반복 사용되고 extension이 다른 key를 선택할 기회를 잃습니다. 따라서 각 물리적 시도에서는 `maxRetries: 0`을 사용하고 retry 여부와 다음 key 선택은 extension이 제어합니다.
+With several pools, a bare `next` or `reset` uses the pool for the selected model when one can be
+inferred. Otherwise it refuses and asks for a pool id or `all`.
 
-## Config reference
+`doctor` checks config metadata, state size/ownership/mode/readability, parent writability, strict
+read-only state parsing, and managed provider/api consistency. It reports `OK`, `WARN`, or `FAIL`. It
+does not call a provider, validate credentials or quota, inspect Windows ACLs, prove every adapter's
+failure shape, or prove hard-link support without a mutation. If config loading failed, the disabled
+`/key-rotator` command shows that load error; the full doctor is not available yet.
 
-| 필드 | 기본값 | 설명 |
-|---|---:|---|
-| `poolId` | 첫 target의 provider ID | 기본 state-file 이름에 사용할 안정적인 pool ID |
-| `targets` | multi-target에서 필수 | `{ provider, api }` 목록. 모든 target이 하나의 pool 공유 |
-| `provider` | legacy 형식에서 필수 | 단일 target의 provider ID |
-| `api` | legacy 형식에서 필수 | 단일 target의 Pi API type |
-| `keys` | 필수 | `{ id, env }` 또는 `{ id, value }` 목록, 최소 2개 |
-| `requestsPerKey` | `20` | 다음 key로 이동하기 전 합산 provider attempt 수 |
-| `maxAttemptsPerRequest` | key 개수 | 하나의 논리 요청에서 시도할 최대 key 수 |
-| `cooldownMs` | `60000` | `429`에 `Retry-After`가 없을 때 cooldown |
-| `transientCooldownMs` | `5000` | network/5xx 계열 실패의 짧은 cooldown |
-| `maxRetryAfterMs` | `900000` | `Retry-After` 적용 상한. `0`이면 상한 없음 |
-| `retryNetworkErrors` | `true` | HTTP response 전 오류에서 failover할지 여부 |
-| `stateFile` | poolId 기반 자동 경로 | shared rotation state JSON 위치 |
-| `lockTimeoutMs` | `5000` | state lock 획득 제한 시간 |
-| `staleLockMs` | `30000` | 비정상 종료 후 lock을 stale로 판단하는 시간 |
+## 10. State v2, locks, and fail-closed behavior
 
-`disableStatuses`와 `cooldownStatuses`의 모든 값은 `retryStatuses`에도 포함되어야 합니다.
+Pi state v2 contains:
 
-## State와 보안
+- `magic: "pi-api-key-rotator-state"`, `version`, `poolId`, and positive `generation`;
+- current-key and attempt counters, timestamps, pool cooldown, and its success-ordering fence;
+- per-key counters/health, outcome ordering, `credentialFingerprint`, and `configRevision`;
+- per-target failure, ordering, and circuit fields.
 
-기본 state 파일은 다음과 같습니다.
+`credentialFingerprint` is lowercase SHA-256 of the resolved secret. The raw secret is never written
+to state. The hash is identity metadata, not encryption; low-entropy secrets can be guessed offline.
+Status snapshots omit both the hash and config revision.
 
-```text
-~/.pi/agent/key-rotator-<poolId>.state.json
-```
+A selection captures state generation as its epoch and captures the credential fingerprint. `reset`
+increments generation, so an older in-flight completion cannot re-disable a reset pool. When a newer
+config replaces the value under the same key id, key-specific health resets for the new identity.
+Old workers and in-flight outcomes cannot update that replacement. Temporarily unconfigured, valid
+records are preserved during rolling config overlap, bounded to 256 keys and 128 targets.
 
-state에는 current key ID, attempt/success/failure counter, disabled 여부, cooldown 종료 시각과 마지막 HTTP status만 저장됩니다. API key 원문, request/response body, prompt, model output은 저장하지 않습니다.
+For each committed write, the extension:
 
-`value` 방식은 key를 `key-rotator.json`에 평문으로 저장합니다. Linux/macOS에서는 다음 권한을 권장합니다.
+1. writes and `fsync`s a unique mode-`0600` candidate;
+2. hard-links the previous immutable state version and moves that link to `<stateFile>.bak`;
+3. atomically renames the candidate over the state file;
+4. syncs the parent directory where the platform supports it.
+
+The `.bak` file is normally the **previous** complete state and is not restored automatically. If the
+platform refuses safe backup replacement, the older known-good backup is kept and can lag by more
+than one transaction. The first state write has no prior backup.
+
+Cross-process mutation publishes a complete, synced lock candidate at `<stateFile>.lock` through a
+hard link. The creator-owned `<stateFile>.lock.reclaim` hard link serializes compare-and-unlink stale
+recovery. A pre-existing reclaim claim is never deleted automatically because Node has no portable
+pathname compare-and-delete operation. A claimant crash fails closed and requires recovery. A time
+stamp alone never steals a live owner's lock. Linux also records a process-start marker to detect PID
+reuse. Malformed lock metadata and unsupported hard-link filesystems fail closed.
+
+The extension does not overwrite evidence when state has malformed JSON/UTF-8 or invalid known
+fields, an unknown version/magic, the wrong `poolId`, unsafe type/ownership/write mode, a symlink or
+repeated identity race, or exceeds `maxStateFileBytes`. A missing state file alone starts fresh.
+
+The loader rejects lexical and physical path collisions **before command-backed secrets run**. It
+resolves symlinked ancestors and existing inode/hard-link aliases for config, state, lock, reclaim,
+and backup paths across all pools. Keep them in a private local directory. This point-in-time check is
+not a sandbox against a hostile process running as the same OS user.
+
+## 11. Recovery
+
+Do not use `/key-rotator reset` to repair corrupt, wrong-pool, oversized, or unsafe state. Reset first
+has to read and validate the existing file.
+
+1. Stop every Pi process that can use the pool.
+2. Preserve the state, `.bak`, `.lock`, and `.lock.reclaim` files for diagnosis.
+3. Fix the cause:
+   - unsafe mode/owner: restore the correct owner and use `chmod 600`;
+   - wrong pool/path collision: point the pool to its own state file;
+   - dynamic size error: raise `maxStateFileBytes` within 16 MiB or reduce ids/keys/targets;
+   - unsupported hard links: move state to a local hard-link-capable filesystem;
+   - lock timeout: confirm every owner is stopped, preserve both sidecars, then archive stale `.lock`
+     and `.lock.reclaim` together. Never remove only one while a writer can run.
+4. If the main state is bad and `<stateFile>.bak` is known-good state for the same pool, copy the
+   backup to a new mode-`0600` file in the same directory, then atomically rename it over the main
+   state. Keep the failed original. Expect to lose the latest committed transaction.
+5. If no valid backup exists, revoke or fix any credential that must remain disabled, archive every
+   state artifact, and let the extension create fresh state. This loses counters and health.
+6. Run `/reload`, `/key-rotator doctor`, and `/key-rotator status`.
+
+A same-directory restore, after all writers are stopped:
 
 ```bash
-chmod 600 ~/.pi/agent/key-rotator.json
+state="$HOME/.pi/agent/key-rotator-POOL_ID.state.json"
+cp "$state" "$state.failed.$(date +%s)"
+cp "$state.bak" "$state.recovered.tmp"
+chmod 600 "$state.recovered.tmp"
+mv "$state.recovered.tmp" "$state"
 ```
 
-실제 credential 파일을 Git repository에 commit하지 마세요. `.gitignore`는 일반적인 local config 이름을 차단하지만 이름이 다른 파일은 Git이 추적할 수 있습니다. 실제 key를 한 번이라도 commit했다면 파일 삭제만으로 해결되지 않으므로 key를 revoke하고 새 key로 교체해야 합니다.
+Validate the backup's `magic`, `version`, and `poolId` before using it. Never delete a lock based only
+on age.
 
-## 개발과 검증
+## 12. Known upstream limits
+
+These boundaries are in Pi 0.84.2, pi-ai, or vendor SDKs:
+
+- Adapter failure reporting is not uniform. Some OpenAI-compatible non-2xx responses, Anthropic
+  HTTP-200 in-band errors, Google paths, and WebSocket paths can omit `onResponse`, status, or
+  `Retry-After`. An unclassified failure cannot receive status-specific disable/cooldown behavior.
+- Pi can classify final error text for agent-level retry after this wrapper exhausts its own budget.
+  Disable `retry.enabled` for a strict whole-turn ceiling.
+- A pi-ai adapter or SDK can log an error, response, header, or request **before** the wrapper sees and
+  redacts its terminal event. This extension cannot scrub an already-written upstream log.
+- Assistant `content` already exposed by incremental events is preserved in a later terminal. Model
+  output is not retroactively rewritten or truncated.
+- `maxRetries: 0` does not prove every nested SDK disabled retry. A nested loop can reuse a
+  credential, so `totalAttempts` and `requestsPerKey` count selected attempts, not every call.
+- Narrow text fallbacks are api-specific. Arbitrary numeric error text is not treated as HTTP status.
+  A new adapter or Pi release needs a real-host test before its failure behavior is claimed.
+
+Secure upstream logs. Keep provider debug logging off around credentials. Keep Pi provider retries at
+zero and review the separate agent-level retry setting.
+
+## 13. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| footer says `keys: disabled` | config/registration failed or a duplicate copy was loaded; run `/key-rotator` for the load error |
+| managed provider sends an unrotated fallback | the selected model api does not match the target api, or another registration won; stop and fix the provider/api contract |
+| `No rotation entry is currently available (...)` | key, target, or pool scope is unavailable; inspect status |
+| `Credential failover exhausted N attempt(s)` | wrapper budget ended or a target/pool circuit stopped selection; Pi may still have an outer retry |
+| state corruption/security/size error | state failed closed; use recovery, not reset |
+| state lock timeout | a live or ambiguous writer owns the lock, or contention exceeded `lockTimeoutMs`; confirm processes before cleanup |
+| filesystem does not support atomic hard-link locks | move `stateFile` to a local hard-link-capable filesystem |
+| `maxStateFileBytes must be at least N` | use at least the reported dynamic minimum |
+| command source timed out/exceeded stdout/could not start | fix the trusted command; output is intentionally omitted from the error |
+| a 401/429 was recorded as network/unknown | that adapter did not expose a supported status shape; check the pinned host limitations and integration tests |
+
+## 14. How it hooks into Pi
+
+Pi 0.84.2 composes an extension `streamSimple` per registered provider and calls it only when the
+selected model's api equals the registration api. The package registers each configured target with
+an inert fallback `rotator-managed-key`, then injects the selected real key into each attempt. It does not install a global per-api dispatcher.
+
+The base attempt stream is `@earendil-works/pi-ai/compat` `streamSimple`. Matching raw,
+URL-encoded, base64, and base64url credential forms in auth-like headers are rotated. Failure event
+and outer retry details are host-specific; see [docs/PI_INTERNALS.md](docs/PI_INTERNALS.md).
+
+| Pi | pi-ai | v0.4.0 status |
+|---|---|---|
+| `0.84.2` | `0.84.2` | verified target |
+
+## 15. Development and release checks
 
 ```bash
-npm install
+npm ci --include=dev
 npm run check
+npm run test:coverage
+npm run test:package
+npm run test:host
 ```
 
-테스트는 legacy 설정 호환성, multi-target registration, shared rotation counter, literal/env/mixed key, `$`/`!` escaping, duplicate target 및 secret validation, `429`/`401`/`5xx`/network failover, stream 시작 후 중복 retry 방지, concurrent state update와 atomic write를 검증합니다.
+The two Pi core packages are wildcard peers because Pi supplies them to installed extensions. The
+lockfile pins exact development and contract-test copies to 0.84.2. CI also runs Ubuntu and Windows
+on Node 22.19 and 24.
 
-## License
-
-MIT
+MIT licensed. See [LICENSE](LICENSE).

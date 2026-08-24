@@ -1,0 +1,57 @@
+{
+  "configVersion": 1,
+  "pools": [
+    {
+      "poolId": "ibm-ica-primary",
+      "targets": [
+        {
+          "provider": "ibm-ica-claude",
+          "api": "anthropic-messages"
+        },
+        {
+          "provider": "ibm-ica",
+          "api": "openai-completions"
+        }
+      ],
+      "keys": [
+        {
+          "id": "primary-key-1",
+          "value": "sk-REPLACE-ME-PRIMARY-1"
+        },
+        {
+          "id": "primary-key-2",
+          "value": "sk-REPLACE-ME-PRIMARY-2"
+        },
+        {
+          "id": "primary-key-3",
+          "value": "sk-REPLACE-ME-PRIMARY-3"
+        }
+      ],
+      "requestsPerKey": 20,
+      "maxAttemptsPerRequest": 3,
+      "rateLimitScope": "key",
+      "targetFailureThreshold": 2,
+      "maxStateFileBytes": 1048576
+    },
+    {
+      "poolId": "ibm-ica-secondary",
+      "provider": "ibm-ica-secondary",
+      "api": "openai-completions",
+      "keys": [
+        {
+          "id": "secondary-key-1",
+          "value": "sk-REPLACE-ME-SECONDARY-1"
+        },
+        {
+          "id": "secondary-key-2",
+          "value": "sk-REPLACE-ME-SECONDARY-2"
+        }
+      ],
+      "requestsPerKey": 10,
+      "maxAttemptsPerRequest": 2,
+      "rateLimitScope": "key",
+      "targetFailureThreshold": 2,
+      "maxStateFileBytes": 1048576
+    }
+  ]
+}

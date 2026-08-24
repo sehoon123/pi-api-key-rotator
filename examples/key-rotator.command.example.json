@@ -1,0 +1,22 @@
+{
+  "configVersion": 1,
+  "poolId": "vault-backed",
+  "provider": "my-company-ai",
+  "api": "openai-completions",
+  "keys": [
+    {
+      "id": "key-1",
+      "command": "op read op://Private/my-company-ai/key-1",
+      "commandTimeoutMs": 10000
+    },
+    {
+      "id": "key-2",
+      "command": "op read op://Private/my-company-ai/key-2",
+      "commandTimeoutMs": 10000
+    }
+  ],
+  "requestsPerKey": 20,
+  "maxAttemptsPerRequest": 2,
+  "rateLimitScope": "key",
+  "targetFailureThreshold": 2
+}
