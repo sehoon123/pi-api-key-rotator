@@ -1,4 +1,4 @@
-import { compactStatus, fallbackApiKey, formatStatus } from "./extension.ts";
+import { compactStatus, fallbackApiKey, formatStatus, STATUS_KEY } from "./extension.ts";
 import type { KeyPool } from "./key-pool.ts";
 import { createRotatingStream } from "./rotating-stream.ts";
 import type {
@@ -12,8 +12,6 @@ import type {
   StreamSimpleLike,
 } from "./types.ts";
 
-const STATUS_KEY = "pi-api-key-rotator";
-
 export interface PoolRuntime {
   config: RotatorConfig;
   pool: KeyPool;
@@ -23,6 +21,10 @@ export interface RegisterMultiPoolDependencies {
   pools: PoolRuntime[];
   baseStreamSimple: StreamSimpleLike;
   createEventStream: EventStreamFactory;
+  /** Called after every direct Pi provider registration succeeds. */
+  onRegistered?: (targets: ReadonlyMap<string, string>) => void;
+  /** Local-only operational report. It must not make provider requests. */
+  doctor?: () => Promise<{ text: string; severity: "OK" | "WARN" | "FAIL" }>;
 }
 
 interface RegisteredPool extends PoolRuntime {
@@ -93,6 +95,7 @@ function usage(): string {
     "Usage:",
     "  /key-rotator status [poolId]",
     "  /key-rotator list",
+    "  /key-rotator doctor",
     "  /key-rotator next <poolId|all>",
     "  /key-rotator reset <poolId|all>",
   ].join("\n");
@@ -110,19 +113,49 @@ export function registerMultiPoolKeyRotatorExtension(
   const byProvider = new Map<string, RegisteredPool>();
   let activeUi: ExtensionContextLike["ui"] | undefined;
   let activePoolId: string | undefined = pools.length === 1 ? pools[0]?.id : undefined;
+  let queuedFooter: { poolId: string; snapshot: PoolSnapshot } | undefined;
+  let footerQueued = false;
 
   const findPool = (id: string): RegisteredPool | undefined => byId.get(id.toLocaleLowerCase("en-US"));
 
-  const refreshFooter = async (): Promise<void> => {
+  const refreshFooter = async (provided?: { poolId: string; snapshot: PoolSnapshot }): Promise<void> => {
     if (!activeUi) return;
     const active = activePoolId ? findPool(activePoolId) : undefined;
-    if (active) {
-      activeUi.setStatus(STATUS_KEY, concisePoolStatus(active.id, await active.pool.snapshot()));
-      return;
+    try {
+      if (active) {
+        const snapshot =
+          provided?.poolId === active.id ? provided.snapshot : await active.pool.snapshot();
+        activeUi.setStatus(STATUS_KEY, concisePoolStatus(active.id, snapshot));
+        return;
+      }
+      activeUi.setStatus(STATUS_KEY, `${pools.length} independent key pools`);
+    } catch {
+      try {
+        activeUi.setStatus(STATUS_KEY, active ? `${active.id}: state unavailable` : "state unavailable");
+      } catch {
+        // Footer rendering must never fail a session or command.
+      }
     }
-    activeUi.setStatus(STATUS_KEY, `${pools.length} independent key pools`);
   };
 
+  const queueFooter = (runtime: RegisteredPool, snapshot: PoolSnapshot): void => {
+    queuedFooter = { poolId: runtime.id, snapshot };
+    if (footerQueued) return;
+    footerQueued = true;
+    queueMicrotask(() => {
+      footerQueued = false;
+      const pending = queuedFooter;
+      queuedFooter = undefined;
+      if (!pending || !activeUi || activePoolId !== pending.poolId) return;
+      try {
+        activeUi.setStatus(STATUS_KEY, concisePoolStatus(pending.poolId, pending.snapshot));
+      } catch {
+        // Best-effort footer updates never affect provider requests.
+      }
+    });
+  };
+
+  const registeredTargets = new Map<string, string>();
   for (const runtime of pools) {
     const firstKey = runtime.config.keys[0];
     if (!firstKey) throw new Error(`Key rotator pool "${runtime.id}" has no resolved API keys.`);
@@ -132,27 +165,44 @@ export function registerMultiPoolKeyRotatorExtension(
       pool: runtime.pool,
       baseStreamSimple: dependencies.baseStreamSimple,
       createEventStream: dependencies.createEventStream,
-      onStateChange: async () => {
-        if (activePoolId === runtime.id || (pools.length === 1 && !activePoolId)) await refreshFooter();
+      onStateChange: (snapshot) => {
+        if (activePoolId === runtime.id || (pools.length === 1 && !activePoolId)) {
+          queueFooter(runtime, snapshot);
+        }
       },
     });
 
     const providerFallback = fallbackApiKey(firstKey);
     for (const target of runtime.targets) {
       byProvider.set(target.provider, runtime);
+      // Pi keeps `streamSimple` per provider. Keep a direct registration and a
+      // target-specific guard instead of Prime's global per-API dispatcher.
+      const guardedStream = ((model, context, options) =>
+        model.provider === target.provider && model.api === target.api
+          ? rotatingStream(model, context, options)
+          : dependencies.baseStreamSimple(model, context, options)) as StreamSimpleLike;
       pi.registerProvider(target.provider, {
         api: target.api,
         apiKey: providerFallback,
-        streamSimple: rotatingStream,
+        streamSimple: guardedStream,
       });
+      registeredTargets.set(target.provider, target.api);
     }
   }
+  dependencies.onRegistered?.(new Map(registeredTargets));
 
-  const notifyAllStatuses = async (ctx: ExtensionContextLike): Promise<void> => {
-    const rendered = await Promise.all(
-      pools.map(async (runtime) => formatStatus(await runtime.pool.snapshot(), runtime.config)),
+  const notifyAllStatuses = async (ctx: ExtensionContextLike): Promise<Map<string, PoolSnapshot>> => {
+    const entries = await Promise.all(
+      pools.map(async (runtime) => {
+        const snapshot = await runtime.pool.snapshot();
+        return { runtime, snapshot };
+      }),
     );
-    ctx.ui.notify(rendered.join("\n\n"), "info");
+    ctx.ui.notify(
+      entries.map(({ runtime, snapshot }) => formatStatus(snapshot, runtime.config)).join("\n\n"),
+      "info",
+    );
+    return new Map(entries.map(({ runtime, snapshot }) => [runtime.id, snapshot] as const));
   };
 
   const resolveCommandPools = (
@@ -180,59 +230,92 @@ export function registerMultiPoolKeyRotatorExtension(
   };
 
   pi.registerCommand("key-rotator", {
-    description: "Inspect, advance, or reset independent API key rotation pools",
+    description: "Inspect, diagnose, advance, or reset independent API key rotation pools",
     handler: async (args, ctx) => {
       activeUi = ctx.ui;
-      const tokens = args.trim().split(/\s+/).filter(Boolean);
-      const action = tokens[0]?.toLowerCase() ?? "status";
-      const selector = tokens[1];
-      if (tokens.length > 2) {
-        ctx.ui.notify(usage(), "warning");
-        return;
-      }
-
-      if (action === "list") {
-        const summaries = await Promise.all(
-          pools.map(async (runtime) => concisePoolStatus(runtime.id, await runtime.pool.snapshot())),
-        );
-        ctx.ui.notify(summaries.join("\n"), "info");
-        await refreshFooter();
-        return;
-      }
-
-      if (action === "status") {
-        if (!selector) {
-          await notifyAllStatuses(ctx);
-        } else {
-          const selected = resolveCommandPools(selector, false, ctx);
-          if (!selected) return;
-          const runtime = selected[0];
-          if (!runtime) return;
-          ctx.ui.notify(formatStatus(await runtime.pool.snapshot(), runtime.config), "info");
-          activePoolId = runtime.id;
+      try {
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        const action = tokens[0]?.toLowerCase() ?? "status";
+        const selector = tokens[1];
+        if (tokens.length > 2) {
+          ctx.ui.notify(usage(), "warning");
+          return;
         }
-        await refreshFooter();
-        return;
-      }
 
-      if (action === "next" || action === "reset") {
-        const selected = resolveCommandPools(selector, true, ctx);
-        if (!selected) return;
-        for (const runtime of selected) {
-          const snapshot = action === "next" ? await runtime.pool.advance() : await runtime.pool.reset();
+        if (action === "doctor") {
+          if (selector || !dependencies.doctor) {
+            ctx.ui.notify(usage(), "warning");
+            return;
+          }
+          const report = await dependencies.doctor();
           ctx.ui.notify(
-            action === "next"
-              ? `Advanced pool "${runtime.id}" to ${snapshot.currentKeyId}.`
-              : `Reset counters, cooldowns, and disabled states for pool "${runtime.id}".`,
-            action === "next" ? "info" : "warning",
+            report.text,
+            report.severity === "FAIL" ? "error" : report.severity === "WARN" ? "warning" : "info",
           );
+          if (report.severity !== "FAIL") await refreshFooter();
+          return;
         }
-        if (selected.length === 1 && selected[0]) activePoolId = selected[0].id;
-        await refreshFooter();
-        return;
-      }
 
-      ctx.ui.notify(usage(), "warning");
+        if (action === "list") {
+          const entries = await Promise.all(
+            pools.map(async (runtime) => ({ runtime, snapshot: await runtime.pool.snapshot() })),
+          );
+          ctx.ui.notify(
+            entries.map(({ runtime, snapshot }) => concisePoolStatus(runtime.id, snapshot)).join("\n"),
+            "info",
+          );
+          const active = entries.find(({ runtime }) => runtime.id === activePoolId);
+          await refreshFooter(active && { poolId: active.runtime.id, snapshot: active.snapshot });
+          return;
+        }
+
+        if (action === "status") {
+          let footerSnapshot: { poolId: string; snapshot: PoolSnapshot } | undefined;
+          if (!selector) {
+            const snapshots = await notifyAllStatuses(ctx);
+            const active = activePoolId ? snapshots.get(activePoolId) : undefined;
+            if (activePoolId && active) footerSnapshot = { poolId: activePoolId, snapshot: active };
+          } else {
+            const selected = resolveCommandPools(selector, false, ctx);
+            if (!selected) return;
+            const runtime = selected[0];
+            if (!runtime) return;
+            const snapshot = await runtime.pool.snapshot();
+            ctx.ui.notify(formatStatus(snapshot, runtime.config), "info");
+            activePoolId = runtime.id;
+            footerSnapshot = { poolId: runtime.id, snapshot };
+          }
+          await refreshFooter(footerSnapshot);
+          return;
+        }
+
+        if (action === "next" || action === "reset") {
+          const selected = resolveCommandPools(selector, true, ctx);
+          if (!selected) return;
+          const snapshots = new Map<string, PoolSnapshot>();
+          for (const runtime of selected) {
+            const snapshot = action === "next" ? await runtime.pool.advance() : await runtime.pool.reset();
+            snapshots.set(runtime.id, snapshot);
+            ctx.ui.notify(
+              action === "next"
+                ? `Advanced pool "${runtime.id}" to ${snapshot.currentKeyId}.`
+                : `Reset counters, cooldowns, and disabled states for pool "${runtime.id}".`,
+              action === "next" ? "info" : "warning",
+            );
+          }
+          if (selected.length === 1 && selected[0]) activePoolId = selected[0].id;
+          const activeSnapshot = activePoolId ? snapshots.get(activePoolId) : undefined;
+          await refreshFooter(
+            activePoolId && activeSnapshot ? { poolId: activePoolId, snapshot: activeSnapshot } : undefined,
+          );
+          return;
+        }
+
+        ctx.ui.notify(usage(), "warning");
+      } catch {
+        ctx.ui.notify("Key-rotator state operation failed. Run /key-rotator doctor before retrying.", "error");
+        await refreshFooter();
+      }
     },
   });
 
@@ -261,7 +344,11 @@ export function registerMultiPoolKeyRotatorExtension(
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    try {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+    } catch {
+      // Session shutdown must not fail because the footer renderer failed.
+    }
     activeUi = undefined;
   });
 }

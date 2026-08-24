@@ -11,7 +11,7 @@ import type {
   StreamSimpleLike,
 } from "./types.ts";
 
-const STATUS_KEY = "pi-api-key-rotator";
+export const STATUS_KEY = "pi-api-key-rotator";
 
 export interface RegisterExtensionDependencies {
   config: RotatorConfig;
@@ -42,20 +42,25 @@ function duration(milliseconds: number): string {
 }
 
 /**
- * Pi provider config values treat a leading `!` as a command and `$NAME` as
- * environment interpolation. Escape those metacharacters when a literal key
- * must be used as the provider's fallback authentication value.
+ * Non-secret stand-in for the provider fallback `apiKey`. Pi requires a
+ * non-empty value before calling `streamSimple`; the rotating stream replaces
+ * this marker with the selected real key for each provider attempt.
  */
-export function escapePiConfigLiteral(value: string): string {
-  const escapedDollars = value.replaceAll("$", () => "$$");
-  return escapedDollars.startsWith("!") ? `$${escapedDollars}` : escapedDollars;
+export const MANAGED_KEY_PLACEHOLDER = "rotator-managed-key";
+
+/** Compatibility helper. Configured literals are never provider fallbacks. */
+export function escapePiConfigLiteral(_value: string): string {
+  return MANAGED_KEY_PLACEHOLDER;
 }
 
-export function fallbackApiKey(key: ResolvedKeyDefinition): string {
-  // v0.1 programmatic configs did not carry `source`; an env name therefore
-  // remains sufficient unless the explicit v0.2 source says the key is literal.
-  if (key.env && key.env !== "<literal>" && key.source !== "literal") return `$${key.env}`;
-  return escapePiConfigLiteral(key.value);
+/** Compatibility alias for callers shared with the Prime package. */
+export function sanitizeProviderLiteral(_value: string): string {
+  return MANAGED_KEY_PLACEHOLDER;
+}
+
+/** The provider registry always receives an inert, non-empty marker. */
+export function fallbackApiKey(_key: ResolvedKeyDefinition): string {
+  return MANAGED_KEY_PLACEHOLDER;
 }
 
 function configuredTargets(config: Pick<RotatorConfig, "provider" | "api" | "targets">) {
@@ -89,7 +94,17 @@ export function formatStatus(
   const lines = [
     `Pool: ${poolId}`,
     "Targets:",
-    ...targets.map((target) => `  - ${target.provider} (${target.api})`),
+    ...targets.map((target) => {
+      const health = snapshot.targets.find((entry) => entry.id === target.provider);
+      const state =
+        health && health.cooldownUntil > now
+          ? `circuit open ${duration(health.cooldownUntil - now)}`
+          : "ready";
+      return `  - ${target.provider} (${target.api}): ${state}; transient failures=${health?.failures ?? 0}`;
+    }),
+    ...(snapshot.poolCooldownUntil > now
+      ? [`Pool cooldown: ${duration(snapshot.poolCooldownUntil - now)}`]
+      : []),
     `Current: ${snapshot.currentKeyId} (${snapshot.requestsOnCurrent}/${snapshot.requestsPerKey})`,
     `Total provider attempts: ${snapshot.totalAttempts}`,
     "",
@@ -119,8 +134,16 @@ export function registerKeyRotatorExtension(
 
   const refreshStatus = async (snapshot?: PoolSnapshot): Promise<void> => {
     if (!activeUi) return;
-    const resolved = snapshot ?? (await pool.snapshot());
-    activeUi.setStatus(STATUS_KEY, compactStatus(resolved));
+    try {
+      const resolved = snapshot ?? (await pool.snapshot());
+      activeUi.setStatus(STATUS_KEY, compactStatus(resolved));
+    } catch {
+      try {
+        activeUi.setStatus(STATUS_KEY, "keys: state unavailable");
+      } catch {
+        // Footer rendering must never fail a session or command.
+      }
+    }
   };
 
   const rotatingStream = createRotatingStream({
@@ -135,13 +158,17 @@ export function registerKeyRotatorExtension(
   const poolId = configuredPoolId(config);
   const providerFallback = fallbackApiKey(firstKey);
   for (const target of targets) {
-    // Every target receives the same stream and KeyPool instance. Therefore
-    // attempts, rotation thresholds, cooldowns, and disabled keys are shared
-    // across all configured provider/API pairs.
+    // Pi stores stream handlers per provider. Each registration therefore gets
+    // a target-specific guard. A mismatched provider or API passes through and
+    // cannot consume this pool's keys or counters.
+    const guardedStream = ((model, context, options) =>
+      model.provider === target.provider && model.api === target.api
+        ? rotatingStream(model, context, options)
+        : dependencies.baseStreamSimple(model, context, options)) as StreamSimpleLike;
     pi.registerProvider(target.provider, {
       api: target.api,
       apiKey: providerFallback,
-      streamSimple: rotatingStream,
+      streamSimple: guardedStream,
     });
   }
 
@@ -151,31 +178,36 @@ export function registerKeyRotatorExtension(
     description: "Show, advance, or reset the shared API key rotation pool",
     handler: async (args, ctx) => {
       activeUi = ctx.ui;
-      const action = args.trim().toLowerCase() || "status";
+      try {
+        const action = args.trim().toLowerCase() || "status";
 
-      if (action === "status") {
-        const snapshot = await pool.snapshot();
-        ctx.ui.notify(formatStatus(snapshot, config), "info");
-        await refreshStatus(snapshot);
-        return;
-      }
-      if (action === "next") {
-        const snapshot = await pool.advance();
-        ctx.ui.notify(`Advanced pool "${poolId}" to ${snapshot.currentKeyId}.`, "info");
-        await refreshStatus(snapshot);
-        return;
-      }
-      if (action === "reset") {
-        const snapshot = await pool.reset();
-        ctx.ui.notify(
-          `Reset counters, cooldowns, and disabled states for pool "${poolId}".`,
-          "warning",
-        );
-        await refreshStatus(snapshot);
-        return;
-      }
+        if (action === "status") {
+          const snapshot = await pool.snapshot();
+          ctx.ui.notify(formatStatus(snapshot, config), "info");
+          await refreshStatus(snapshot);
+          return;
+        }
+        if (action === "next") {
+          const snapshot = await pool.advance();
+          ctx.ui.notify(`Advanced pool "${poolId}" to ${snapshot.currentKeyId}.`, "info");
+          await refreshStatus(snapshot);
+          return;
+        }
+        if (action === "reset") {
+          const snapshot = await pool.reset();
+          ctx.ui.notify(
+            `Reset counters, cooldowns, and disabled states for pool "${poolId}".`,
+            "warning",
+          );
+          await refreshStatus(snapshot);
+          return;
+        }
 
-      ctx.ui.notify("Usage: /key-rotator [status|next|reset]", "warning");
+        ctx.ui.notify("Usage: /key-rotator [status|next|reset]", "warning");
+      } catch {
+        ctx.ui.notify("Key-rotator state operation failed. Inspect the state file before retrying.", "error");
+        await refreshStatus();
+      }
     },
   });
 
@@ -199,7 +231,11 @@ export function registerKeyRotatorExtension(
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    try {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+    } catch {
+      // Session shutdown must not fail because the footer renderer failed.
+    }
     activeUi = undefined;
   });
 }

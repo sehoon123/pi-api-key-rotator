@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { compactStatus, formatStatus, registerKeyRotatorExtension } from "../src/extension.ts";
+import {
+  compactStatus,
+  formatStatus,
+  MANAGED_KEY_PLACEHOLDER,
+  registerKeyRotatorExtension,
+} from "../src/extension.ts";
 import { createInitialPoolState, KeyPool } from "../src/key-pool.ts";
 import { InMemoryStateStore } from "../src/state-store.ts";
 import type {
@@ -68,7 +73,7 @@ function makeUi() {
 
 const neverCalledStream: StreamSimpleLike = () => new TestEventStream();
 
-test("registers a wrapper for the existing provider and uses only an env reference as fallback auth", () => {
+test("registers a guarded wrapper with only the inert managed fallback", () => {
   const time = mutableClock(100);
   const config = makeConfig();
   const pool = new KeyPool(
@@ -87,7 +92,9 @@ test("registers a wrapper for the existing provider and uses only an env referen
 
   assert.equal(pi.provider?.name, "test-provider");
   assert.equal(pi.provider?.config.api, "openai-completions");
-  assert.equal(pi.provider?.config.apiKey, "$TEST_KEY_1");
+  assert.equal(pi.provider?.config.apiKey, MANAGED_KEY_PLACEHOLDER);
+  assert.ok(!pi.provider?.config.apiKey.includes("TEST_KEY_1"));
+  assert.ok(!pi.provider?.config.apiKey.includes("secret-one"));
   assert.equal(typeof pi.provider?.config.streamSimple, "function");
   assert.ok(pi.commands.has("key-rotator"));
 });
@@ -184,6 +191,20 @@ test("status formatting includes operational data but not environment values", (
     requestsPerKey: 20,
     totalAttempts: 24,
     updatedAt: 100,
+    poolCooldownUntil: 1_100,
+    targets: [
+      {
+        id: "company-ai",
+        available: false,
+        failures: 3,
+        consecutiveFailures: 2,
+        cooldownUntil: 5_100,
+        lastStatus: 503,
+        lastFailureAt: 100,
+        lastSuccessAt: 50,
+        lastOutcomeAttempt: 24,
+      },
+    ],
     keys: [
       {
         id: "primary",
@@ -206,5 +227,50 @@ test("status formatting includes operational data but not environment values", (
   assert.equal(compactStatus(snapshot, 100), "keys: primary 4/20");
   const detailed = formatStatus(snapshot, "company-ai", 100);
   assert.match(detailed, /attempts=24/);
+  assert.match(detailed, /circuit open 5s/);
+  assert.match(detailed, /transient failures=3/);
+  assert.match(detailed, /Pool cooldown: 1s/);
   assert.doesNotMatch(detailed, /VERY_SECRET_ENV/);
+});
+
+test("the per-provider guard passes mismatched provider and API calls through unchanged", async () => {
+  const time = mutableClock(1_000);
+  const config = makeConfig();
+  const pool = new KeyPool(
+    config,
+    new InMemoryStateStore(createInitialPoolState(config, time.clock.now())),
+    time.clock,
+  );
+  const pi = new MockPi();
+  const calls: Array<{ provider: string; api: string; apiKey: string | undefined }> = [];
+  const baseStream: StreamSimpleLike = (model, _context, options) => {
+    calls.push({ provider: model.provider, api: model.api, apiKey: options?.apiKey });
+    return new TestEventStream();
+  };
+
+  registerKeyRotatorExtension(pi, {
+    config,
+    pool,
+    baseStreamSimple: baseStream,
+    createEventStream: () => new TestEventStream(),
+  });
+
+  const registered = pi.provider?.config.streamSimple;
+  assert.ok(registered);
+  registered(
+    { provider: "other-provider", api: "openai-completions", id: "wrong-provider" },
+    {},
+    { apiKey: "caller-key" },
+  );
+  registered(
+    { provider: "test-provider", api: "anthropic-messages", id: "wrong-api" },
+    {},
+    { apiKey: "caller-key" },
+  );
+
+  assert.deepEqual(calls, [
+    { provider: "other-provider", api: "openai-completions", apiKey: "caller-key" },
+    { provider: "test-provider", api: "anthropic-messages", apiKey: "caller-key" },
+  ]);
+  assert.equal((await pool.snapshot()).totalAttempts, 0);
 });

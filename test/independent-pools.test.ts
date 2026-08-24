@@ -260,3 +260,108 @@ test("commands target one named pool and do not print raw keys", async () => {
   assert.match(notifications.at(-1) ?? "", /Pool: secondary/);
   assert.doesNotMatch(notifications.join("\n"), /primary-one|secondary-one/);
 });
+
+test("each direct Pi registration guards both its provider and API", async () => {
+  const { primary, secondary, primaryPool, secondaryPool } = runtimes();
+  const calls: Array<{ provider: string; api: string; apiKey: string | undefined }> = [];
+  const base: StreamSimpleLike = (selectedModel, _context, options) => {
+    calls.push({ provider: selectedModel.provider, api: selectedModel.api, apiKey: options?.apiKey });
+    const stream = new TestEventStream();
+    queueMicrotask(() => {
+      stream.push({
+        type: "done",
+        reason: "stop",
+        message: assistantMessage("stop", {
+          provider: selectedModel.provider,
+          api: selectedModel.api,
+          model: selectedModel.id,
+        }),
+      });
+    });
+    return stream;
+  };
+  const pi = new MockPi();
+  registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [
+      { config: primary, pool: primaryPool },
+      { config: secondary, pool: secondaryPool },
+    ],
+    baseStreamSimple: base,
+    createEventStream: () => new TestEventStream(),
+  });
+
+  const primaryRegistration = pi.providers.get("provider-primary");
+  const secondaryRegistration = pi.providers.get("provider-secondary");
+  assert.ok(primaryRegistration);
+  assert.ok(secondaryRegistration);
+  assert.notEqual(primaryRegistration.streamSimple, secondaryRegistration.streamSimple);
+
+  await collect(primaryRegistration.streamSimple(model("provider-secondary"), {}, { apiKey: "caller-key" }));
+  await collect(
+    primaryRegistration.streamSimple(
+      { provider: "provider-primary", api: "anthropic-messages", id: "wrong-api" },
+      {},
+      { apiKey: "caller-key" },
+    ),
+  );
+
+  assert.deepEqual(calls, [
+    { provider: "provider-secondary", api: "openai-completions", apiKey: "caller-key" },
+    { provider: "provider-primary", api: "anthropic-messages", apiKey: "caller-key" },
+  ]);
+  assert.equal((await primaryPool.snapshot()).totalAttempts, 0);
+  assert.equal((await secondaryPool.snapshot()).totalAttempts, 0);
+});
+
+test("a command reuses its atomic snapshot for the footer", async () => {
+  const { primary, primaryPool } = runtimes();
+  const originalSnapshot = primaryPool.snapshot.bind(primaryPool);
+  let snapshotReads = 0;
+  primaryPool.snapshot = async () => {
+    snapshotReads += 1;
+    return originalSnapshot();
+  };
+  const pi = new MockPi();
+  registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [{ config: primary, pool: primaryPool }],
+    baseStreamSimple: () => new TestEventStream(),
+    createEventStream: () => new TestEventStream(),
+  });
+  const statuses: string[] = [];
+  const ctx: ExtensionContextLike = {
+    ui: {
+      notify() {},
+      setStatus(_key, text) {
+        if (text) statuses.push(text);
+      },
+    },
+  };
+
+  await pi.commands.get("key-rotator")!.handler("status primary", ctx);
+  assert.equal(snapshotReads, 1);
+  assert.match(statuses.at(-1) ?? "", /^primary:/);
+});
+
+test("doctor FAIL uses an error notification and never refreshes a broken footer", async () => {
+  const { primary, primaryPool } = runtimes();
+  const pi = new MockPi();
+  registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [{ config: primary, pool: primaryPool }],
+    baseStreamSimple: successfulStream([]),
+    createEventStream: () => new TestEventStream(),
+    doctor: async () => ({ text: "[FAIL] State: corrupt", severity: "FAIL" }),
+  });
+  const notices: Array<{ text: string; type: string | undefined }> = [];
+  const ctx: ExtensionContextLike = {
+    ui: {
+      notify: (text, type) => notices.push({ text, type }),
+      setStatus: () => {
+        throw new Error("footer must not run after doctor failure");
+      },
+    },
+  };
+  const command = pi.commands.get("key-rotator");
+  assert.ok(command);
+  await command.handler("doctor", ctx);
+  assert.deepEqual(notices, [{ text: "[FAIL] State: corrupt", type: "error" }]);
+});
