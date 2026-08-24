@@ -134,16 +134,45 @@ test("the default state file stays under the Pi agent directory", () => {
   assert.equal(config.stateFile, resolve("/home/tester/.pi/agent/key-rotator-company-ai.state.json"));
 });
 
-test("PI_KEY_ROTATOR_CONFIG selects the configuration file", async () => {
+test("PI_CODING_AGENT_DIR moves the default config and state together", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-key-rotator-agent-dir-"));
+  const agentDirectory = join(root, "custom-agent");
+  const configFile = join(agentDirectory, "key-rotator.json");
+  await mkdir(agentDirectory, { recursive: true });
+  await writeFile(configFile, JSON.stringify(validRaw), { encoding: "utf8", mode: 0o600 });
+  try {
+    const config = await loadConfig({
+      homeDir: root,
+      env: {
+        KEY_ONE: "one",
+        KEY_TWO: "two",
+        PI_CODING_AGENT_DIR: "~/custom-agent",
+      },
+    });
+    assert.equal(config.configFile, configFile);
+    assert.equal(config.stateFile, join(agentDirectory, "key-rotator-company-ai.state.json"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PI_KEY_ROTATOR_CONFIG wins over PI_CODING_AGENT_DIR for the config path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-key-rotator-env-"));
   const configFile = join(directory, "custom.json");
+  const agentDirectory = join(directory, "agent-override");
   await writeFile(configFile, JSON.stringify(validRaw), { encoding: "utf8", mode: 0o600 });
   try {
     const config = await loadConfig({
       homeDir: directory,
-      env: { KEY_ONE: "one", KEY_TWO: "two", PI_KEY_ROTATOR_CONFIG: configFile },
+      env: {
+        KEY_ONE: "one",
+        KEY_TWO: "two",
+        PI_KEY_ROTATOR_CONFIG: configFile,
+        PI_CODING_AGENT_DIR: agentDirectory,
+      },
     });
     assert.equal(config.configFile, configFile);
+    assert.equal(config.stateFile, join(agentDirectory, "key-rotator-company-ai.state.json"));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -159,7 +188,12 @@ test("an explicit config path wins over PI_KEY_ROTATOR_CONFIG", async () => {
     const config = await loadConfig({
       configFile: explicitFile,
       homeDir: directory,
-      env: { KEY_ONE: "one", KEY_TWO: "two", PI_KEY_ROTATOR_CONFIG: environmentFile },
+      env: {
+        KEY_ONE: "one",
+        KEY_TWO: "two",
+        PI_KEY_ROTATOR_CONFIG: environmentFile,
+        PI_CODING_AGENT_DIR: join(directory, "agent-override"),
+      },
     });
     assert.equal(config.configFile, explicitFile);
     assert.equal(config.requestsPerKey, 3);

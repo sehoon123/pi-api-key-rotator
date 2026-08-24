@@ -8,6 +8,8 @@ import { join } from "node:path";
 
 /** Config path override understood by this extension. */
 export const CONFIG_PATH_ENV = "PI_KEY_ROTATOR_CONFIG";
+/** Pi's host-level override for `~/.pi/agent`. */
+export const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 export const AGENT_DIR_SEGMENTS = [".pi", "agent"] as const;
 export const CONFIG_FILE_NAME = "key-rotator.json";
 export const stateFileName = (poolId: string): string => `key-rotator-${poolId}.state.json`;
@@ -26,9 +28,13 @@ export function expandHome(input: string, homeDir: string): string {
   return input;
 }
 
-/** Pi's default coding-agent directory is `<home>/.pi/agent`. */
+/** `$PI_CODING_AGENT_DIR` when set, else `<home>/.pi/agent`. */
 export function resolveAgentDir(options: PathEnvironment = {}): string {
-  return join(options.homeDir ?? homedir(), ...AGENT_DIR_SEGMENTS);
+  const env = options.env ?? process.env;
+  const homeDir = options.homeDir ?? homedir();
+  const override = env[AGENT_DIR_ENV]?.trim();
+  if (override) return expandHome(override, homeDir);
+  return join(homeDir, ...AGENT_DIR_SEGMENTS);
 }
 
 export function defaultConfigFile(options: PathEnvironment = {}): string {
