@@ -10,6 +10,8 @@ import type {
   ExtensionApiLike,
   ExtensionContextLike,
   ModelLike,
+  PoolSnapshot,
+  PoolState,
   RotatorConfig,
   StreamSimpleLike,
 } from "../src/types.ts";
@@ -110,6 +112,13 @@ class MockPi implements ExtensionApiLike {
     handlers.push(handler);
     this.handlers.set(event, handlers);
   }
+  async emit(
+    event: "session_start" | "model_select" | "session_shutdown",
+    payload: unknown,
+    ctx: ExtensionContextLike,
+  ): Promise<void> {
+    for (const handler of this.handlers.get(event) ?? []) await handler(payload, ctx);
+  }
 }
 
 function config(poolId: string, provider: string, prefix: string): RotatorConfig {
@@ -164,11 +173,61 @@ function successfulStream(calls: Array<{ provider: string; apiKey: string | unde
   };
 }
 
+function deferred<T>() {
+  let resolvePromise: (value: T) => void = () => {};
+  let rejectPromise: (error: unknown) => void = () => {};
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
+
+class TrackingStateStore {
+  reads = 0;
+  transactions = 0;
+  state: PoolState;
+
+  constructor(state: PoolState) {
+    this.state = structuredClone(state);
+  }
+
+  async read(): Promise<PoolState> {
+    this.reads += 1;
+    return structuredClone(this.state);
+  }
+
+  async transact<R>(mutator: (state: PoolState) => R | Promise<R>): Promise<R> {
+    this.transactions += 1;
+    const working = structuredClone(this.state);
+    const result = await mutator(working);
+    this.state = working;
+    return result;
+  }
+}
+
+function uiRecorder(modelValue?: ModelLike) {
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const statuses: string[] = [];
+  const ctx: ExtensionContextLike = {
+    ...(modelValue ? { model: modelValue } : {}),
+    ui: {
+      notify(message, type) {
+        notifications.push({ message, type });
+      },
+      setStatus(_key, text) {
+        if (text !== undefined) statuses.push(text);
+      },
+    },
+  };
+  return { ctx, notifications, statuses };
+}
+
 test("requests rotate only inside the endpoint pool that owns the provider", async () => {
   const { primary, secondary, primaryPool, secondaryPool } = runtimes();
   const calls: Array<{ provider: string; apiKey: string | undefined }> = [];
   const pi = new MockPi();
-  registerMultiPoolKeyRotatorExtension(pi, {
+  await registerMultiPoolKeyRotatorExtension(pi, {
     pools: [
       { config: primary, pool: primaryPool },
       { config: secondary, pool: secondaryPool },
@@ -213,7 +272,7 @@ test("401 in one pool does not disable a key in another pool", async () => {
   };
 
   const pi = new MockPi();
-  registerMultiPoolKeyRotatorExtension(pi, {
+  await registerMultiPoolKeyRotatorExtension(pi, {
     pools: [
       { config: primary, pool: primaryPool },
       { config: secondary, pool: secondaryPool },
@@ -232,7 +291,7 @@ test("401 in one pool does not disable a key in another pool", async () => {
 test("commands target one named pool and do not print raw keys", async () => {
   const { primary, secondary, primaryPool, secondaryPool } = runtimes();
   const pi = new MockPi();
-  registerMultiPoolKeyRotatorExtension(pi, {
+  await registerMultiPoolKeyRotatorExtension(pi, {
     pools: [
       { config: primary, pool: primaryPool },
       { config: secondary, pool: secondaryPool },
@@ -281,7 +340,7 @@ test("each direct Pi registration guards both its provider and API", async () =>
     return stream;
   };
   const pi = new MockPi();
-  registerMultiPoolKeyRotatorExtension(pi, {
+  await registerMultiPoolKeyRotatorExtension(pi, {
     pools: [
       { config: primary, pool: primaryPool },
       { config: secondary, pool: secondaryPool },
@@ -322,13 +381,15 @@ test("a command reuses its atomic snapshot for the footer", async () => {
     return originalSnapshot();
   };
   const pi = new MockPi();
-  registerMultiPoolKeyRotatorExtension(pi, {
+  await registerMultiPoolKeyRotatorExtension(pi, {
     pools: [{ config: primary, pool: primaryPool }],
     baseStreamSimple: () => new TestEventStream(),
     createEventStream: () => new TestEventStream(),
   });
+  const preflightReads = snapshotReads;
   const statuses: string[] = [];
   const ctx: ExtensionContextLike = {
+    model: model("provider-primary"),
     ui: {
       notify() {},
       setStatus(_key, text) {
@@ -338,14 +399,14 @@ test("a command reuses its atomic snapshot for the footer", async () => {
   };
 
   await pi.commands.get("key-rotator")!.handler("status primary", ctx);
-  assert.equal(snapshotReads, 1);
+  assert.equal(snapshotReads - preflightReads, 1);
   assert.match(statuses.at(-1) ?? "", /^primary:/);
 });
 
 test("doctor FAIL uses an error notification and never refreshes a broken footer", async () => {
   const { primary, primaryPool } = runtimes();
   const pi = new MockPi();
-  registerMultiPoolKeyRotatorExtension(pi, {
+  await registerMultiPoolKeyRotatorExtension(pi, {
     pools: [{ config: primary, pool: primaryPool }],
     baseStreamSimple: successfulStream([]),
     createEventStream: () => new TestEventStream(),
@@ -364,4 +425,189 @@ test("doctor FAIL uses an error notification and never refreshes a broken footer
   assert.ok(command);
   await command.handler("doctor", ctx);
   assert.deepEqual(notices, [{ text: "[FAIL] State: corrupt", type: "error" }]);
+});
+
+
+test("state preflight disables only the invalid pool and never mutates its evidence", async () => {
+  const clock = mutableClock(1_000).clock;
+  const primary = config("primary", "provider-primary", "primary");
+  const secondary = config("secondary", "provider-secondary", "secondary");
+  const primaryStore = new TrackingStateStore(createInitialPoolState(primary, clock.now()));
+  const wrongPoolState = createInitialPoolState(secondary, clock.now());
+  wrongPoolState.poolId = "some-other-pool";
+  const secondaryStore = new TrackingStateStore(wrongPoolState);
+  const evidenceBefore = JSON.stringify(secondaryStore.state);
+  const registered = new Map<string, string>();
+  const pi = new MockPi();
+
+  await registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [
+      { config: primary, pool: new KeyPool(primary, primaryStore, clock) },
+      { config: secondary, pool: new KeyPool(secondary, secondaryStore, clock) },
+    ],
+    baseStreamSimple: () => new TestEventStream(),
+    createEventStream: () => new TestEventStream(),
+    onRegistered: (targets) => {
+      for (const [provider, api] of targets) registered.set(provider, api);
+    },
+  });
+
+  assert.ok(pi.providers.has("provider-primary"));
+  assert.equal(pi.providers.has("provider-secondary"), false);
+  assert.deepEqual([...registered], [["provider-primary", "openai-completions"]]);
+  assert.equal(primaryStore.reads, 1);
+  assert.equal(secondaryStore.reads, 1);
+  assert.equal(primaryStore.transactions, 0);
+  assert.equal(secondaryStore.transactions, 0);
+  assert.equal(JSON.stringify(secondaryStore.state), evidenceBefore);
+
+  const ui = uiRecorder(model("provider-secondary"));
+  await pi.emit("session_start", {}, ui.ctx);
+  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*pool "secondary".*disabled/i);
+  await pi.commands.get("key-rotator")!.handler("status secondary", ui.ctx);
+  assert.match(ui.notifications.at(-1)?.message ?? "", /evidence is preserved/i);
+  assert.equal(secondaryStore.transactions, 0);
+  assert.equal(JSON.stringify(secondaryStore.state), evidenceBefore);
+});
+
+test("unmanaged and API-mismatched models clear active selection and fence bare mutations", async () => {
+  const { primary, secondary, primaryPool, secondaryPool } = runtimes();
+  const pi = new MockPi();
+  await registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [
+      { config: primary, pool: primaryPool },
+      { config: secondary, pool: secondaryPool },
+    ],
+    baseStreamSimple: () => new TestEventStream(),
+    createEventStream: () => new TestEventStream(),
+  });
+  const ui = uiRecorder(model("provider-primary"));
+  const command = pi.commands.get("key-rotator")!;
+
+  await pi.emit("session_start", {}, ui.ctx);
+  await command.handler("next", ui.ctx);
+  assert.equal((await primaryPool.snapshot()).currentKeyId, "key-2");
+
+  const unmanaged = { provider: "ordinary-provider", api: "openai-completions", id: "ordinary" };
+  await pi.emit("model_select", { model: unmanaged }, ui.ctx);
+  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  const primaryBeforeRefusedReset = await primaryPool.snapshot();
+  await command.handler("reset", ui.ctx);
+  const primaryAfterRefusedReset = await primaryPool.snapshot();
+  assert.equal(primaryAfterRefusedReset.currentKeyId, "key-2");
+  assert.equal(primaryAfterRefusedReset.generation, primaryBeforeRefusedReset.generation);
+  assert.match(ui.notifications.at(-1)?.message ?? "", /bare destructive command was refused/i);
+
+  const mismatch = { provider: "provider-secondary", api: "anthropic-messages", id: "wrong-api" };
+  await pi.emit("model_select", { model: mismatch }, ui.ctx);
+  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*API mismatch/i);
+  assert.match(ui.statuses.at(-1) ?? "", /selected "anthropic-messages".*configured "openai-completions"/i);
+  await command.handler("next", ui.ctx);
+  assert.equal((await secondaryPool.snapshot()).currentKeyId, "key-1");
+  assert.match(ui.notifications.at(-1)?.message ?? "", /bare destructive command was refused/i);
+
+  // An explicit selector remains an intentional administrative action.
+  await command.handler("next secondary", ui.ctx);
+  assert.equal((await secondaryPool.snapshot()).currentKeyId, "key-2");
+  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*API mismatch/i);
+});
+
+test("a deferred session snapshot cannot paint a newer UI owner", async () => {
+  const { primary, primaryPool } = runtimes();
+  const pi = new MockPi();
+  await registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [{ config: primary, pool: primaryPool }],
+    baseStreamSimple: () => new TestEventStream(),
+    createEventStream: () => new TestEventStream(),
+  });
+  const originalSnapshot = primaryPool.snapshot.bind(primaryPool);
+  const staleSnapshot = await originalSnapshot();
+  const pending = deferred<PoolSnapshot>();
+  let pendingReads = 0;
+  primaryPool.snapshot = async () => {
+    pendingReads += 1;
+    return pending.promise;
+  };
+
+  const oldUi = uiRecorder(model("provider-primary"));
+  const oldStart = pi.emit("session_start", {}, oldUi.ctx);
+  await Promise.resolve();
+  assert.equal(pendingReads, 1);
+
+  const newUi = uiRecorder({
+    provider: "ordinary-provider",
+    api: "openai-completions",
+    id: "ordinary",
+  });
+  await pi.emit("session_start", {}, newUi.ctx);
+  assert.match(newUi.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  pending.resolve(staleSnapshot);
+  await oldStart;
+
+  assert.deepEqual(oldUi.statuses, []);
+  assert.match(newUi.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  primaryPool.snapshot = originalSnapshot;
+});
+
+test("deferred command results are silent after model selection changes", async () => {
+  const { primary, primaryPool } = runtimes();
+  const pi = new MockPi();
+  await registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [{ config: primary, pool: primaryPool }],
+    baseStreamSimple: () => new TestEventStream(),
+    createEventStream: () => new TestEventStream(),
+  });
+  const originalSnapshot = primaryPool.snapshot.bind(primaryPool);
+  const result = await originalSnapshot();
+  const ui = uiRecorder(model("provider-primary"));
+  await pi.emit("session_start", {}, ui.ctx);
+
+  const pending = deferred<PoolSnapshot>();
+  let pendingReads = 0;
+  primaryPool.snapshot = async () => {
+    pendingReads += 1;
+    return pending.promise;
+  };
+  const noticesBefore = ui.notifications.length;
+  const commandResult = pi.commands.get("key-rotator")!.handler("status primary", ui.ctx);
+  await Promise.resolve();
+  assert.equal(pendingReads, 1);
+
+  await pi.emit(
+    "model_select",
+    { model: { provider: "ordinary-provider", api: "openai-completions", id: "ordinary" } },
+    ui.ctx,
+  );
+  pending.resolve(result);
+  await commandResult;
+
+  assert.equal(ui.notifications.length, noticesBefore);
+  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  primaryPool.snapshot = originalSnapshot;
+});
+
+test("a queued request footer stays newer than an earlier deferred snapshot", async () => {
+  const { primary, primaryPool } = runtimes();
+  const pi = new MockPi();
+  await registerMultiPoolKeyRotatorExtension(pi, {
+    pools: [{ config: primary, pool: primaryPool }],
+    baseStreamSimple: successfulStream([]),
+    createEventStream: () => new TestEventStream(),
+  });
+  const originalSnapshot = primaryPool.snapshot.bind(primaryPool);
+  const staleSnapshot = await originalSnapshot();
+  const pending = deferred<PoolSnapshot>();
+  primaryPool.snapshot = async () => pending.promise;
+  const ui = uiRecorder(model("provider-primary"));
+
+  const startup = pi.emit("session_start", {}, ui.ctx);
+  await Promise.resolve();
+  await collect(pi.providers.get("provider-primary")!.streamSimple(model("provider-primary"), {}));
+  await Promise.resolve();
+  assert.match(ui.statuses.at(-1) ?? "", /^primary: key-1 1\/2$/);
+
+  pending.resolve(staleSnapshot);
+  await startup;
+  assert.match(ui.statuses.at(-1) ?? "", /^primary: key-1 1\/2$/);
+  primaryPool.snapshot = originalSnapshot;
 });

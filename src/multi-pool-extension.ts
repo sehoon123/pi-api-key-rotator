@@ -32,6 +32,49 @@ interface RegisteredPool extends PoolRuntime {
   targets: RotatorTarget[];
 }
 
+interface EnabledPool extends RegisteredPool {
+  mode: "enabled";
+}
+
+interface DisabledPool extends RegisteredPool {
+  mode: "disabled";
+  /** Sanitized startup failure retained for local status output. */
+  failure: string;
+}
+
+type PreparedPool = EnabledPool | DisabledPool;
+
+type InactiveReason =
+  | { kind: "no-model" }
+  | { kind: "unmanaged"; provider: string }
+  | {
+      kind: "api-mismatch";
+      poolId: string;
+      provider: string;
+      configuredApi: string;
+      selectedApi: string;
+    }
+  | { kind: "pool-disabled"; poolId: string };
+
+type SelectionState =
+  | { kind: "active"; runtime: EnabledPool; target: RotatorTarget }
+  | { kind: "inactive"; reason: InactiveReason };
+
+interface UiOwner {
+  generation: number;
+  ui: ExtensionContextLike["ui"];
+}
+
+interface OwnerToken {
+  owner: UiOwner;
+  selectionGeneration: number;
+}
+
+interface FooterSnapshot {
+  poolId: string;
+  snapshot: PoolSnapshot;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -86,8 +129,87 @@ function validateRegistrationPlan(runtimes: PoolRuntime[]): RegisteredPool[] {
   });
 }
 
+function sanitizedStateFailure(error: unknown): string {
+  // The evidence is the untouched state file, not exception text. A custom
+  // StateStore can throw arbitrary or encoded credentials, so retain only a
+  // fixed diagnostic class and never forward error.message.
+  const name = error instanceof Error ? error.name : "";
+  if (name === "StateFileTooLargeError") return "state file exceeds its configured size limit";
+  if (name === "StateSecurityError") return "state file failed security validation";
+  if (name === "StateCorruptionError") return "state file failed structural validation";
+  return "state validation failed";
+}
+
+async function preflightPools(pools: RegisteredPool[]): Promise<PreparedPool[]> {
+  return Promise.all(
+    pools.map(async (runtime): Promise<PreparedPool> => {
+      try {
+        // snapshot() is deliberately read-only: a rejected preflight must leave
+        // the original file and all forensic evidence untouched.
+        await runtime.pool.snapshot();
+        return { ...runtime, mode: "enabled" };
+      } catch (error) {
+        return {
+          ...runtime,
+          mode: "disabled",
+          failure: sanitizedStateFailure(error),
+        };
+      }
+    }),
+  );
+}
+
+function isEnabled(runtime: PreparedPool): runtime is EnabledPool {
+  return runtime.mode === "enabled";
+}
+
 function concisePoolStatus(id: string, snapshot: PoolSnapshot): string {
   return `${id}: ${compactStatus(snapshot).replace(/^keys:\s*/, "")}`;
+}
+
+function disabledPoolStatus(runtime: DisabledPool): string {
+  return [
+    `Pool: ${runtime.id}`,
+    "Rotation: disabled",
+    "Reason: state preflight failed; the state file was not changed so evidence is preserved.",
+    `State error: ${runtime.failure}`,
+  ].join("\n");
+}
+
+function conciseDisabledPoolStatus(runtime: DisabledPool): string {
+  return `${runtime.id}: disabled (state preflight failed; evidence preserved)`;
+}
+
+function inactiveFooter(reason: InactiveReason): string {
+  switch (reason.kind) {
+    case "no-model":
+      return "rotation inactive: no model selected";
+    case "unmanaged":
+      return `rotation inactive: provider "${reason.provider}" is unmanaged`;
+    case "api-mismatch":
+      return (
+        `rotation inactive: API mismatch for provider "${reason.provider}" ` +
+        `(selected "${reason.selectedApi}", configured "${reason.configuredApi}")`
+      );
+    case "pool-disabled":
+      return `rotation inactive: pool "${reason.poolId}" is disabled after state preflight failure`;
+  }
+}
+
+function inactiveCommandReason(reason: InactiveReason): string {
+  switch (reason.kind) {
+    case "no-model":
+      return "no model is selected";
+    case "unmanaged":
+      return `provider "${reason.provider}" is unmanaged`;
+    case "api-mismatch":
+      return (
+        `provider "${reason.provider}" uses API "${reason.selectedApi}" instead of ` +
+        `configured API "${reason.configuredApi}"`
+      );
+    case "pool-disabled":
+      return `pool "${reason.poolId}" is disabled because state preflight failed`;
+  }
 }
 
 function usage(): string {
@@ -101,86 +223,185 @@ function usage(): string {
   ].join("\n");
 }
 
-/** Register one independent rotating stream and stateful KeyPool per pool. */
-export function registerMultiPoolKeyRotatorExtension(
+/** Register one independent rotating stream and stateful KeyPool per healthy pool. */
+export async function registerMultiPoolKeyRotatorExtension(
   pi: ExtensionApiLike,
   dependencies: RegisterMultiPoolDependencies,
-): void {
-  // Validate the whole plan before registering anything. This avoids a partially
-  // active extension when a later pool contains an overlapping provider.
-  const pools = validateRegistrationPlan(dependencies.pools);
+): Promise<void> {
+  // Validate the whole plan before any asynchronous work or registration. This
+  // avoids a partially active extension for an overlapping provider plan.
+  const plannedPools = validateRegistrationPlan(dependencies.pools);
+  // Every pool gets an independent read-only preflight. A bad state disables
+  // only that pool; healthy pools still register their direct Pi providers.
+  const pools = await preflightPools(plannedPools);
+  const enabledPools = pools.filter(isEnabled);
   const byId = new Map(pools.map((runtime) => [runtime.id.toLocaleLowerCase("en-US"), runtime] as const));
-  const byProvider = new Map<string, RegisteredPool>();
-  let activeUi: ExtensionContextLike["ui"] | undefined;
-  let activePoolId: string | undefined = pools.length === 1 ? pools[0]?.id : undefined;
-  let queuedFooter: { poolId: string; snapshot: PoolSnapshot } | undefined;
+  const byProvider = new Map<string, PreparedPool>();
+  for (const runtime of pools) {
+    for (const target of runtime.targets) byProvider.set(target.provider, runtime);
+  }
+
+  let ownerGeneration = 0;
+  let activeOwner: UiOwner | undefined;
+  let selectionGeneration = 0;
+  let selection: SelectionState = { kind: "inactive", reason: { kind: "no-model" } };
+  let footerSequence = 0;
+  let queuedFooter:
+    | { runtime: EnabledPool; snapshot: PoolSnapshot; token: OwnerToken }
+    | undefined;
   let footerQueued = false;
 
-  const findPool = (id: string): RegisteredPool | undefined => byId.get(id.toLocaleLowerCase("en-US"));
+  const findPool = (id: string): PreparedPool | undefined => byId.get(id.toLocaleLowerCase("en-US"));
 
-  const refreshFooter = async (provided?: { poolId: string; snapshot: PoolSnapshot }): Promise<void> => {
-    if (!activeUi) return;
-    const active = activePoolId ? findPool(activePoolId) : undefined;
+  const beginOwner = (ui: ExtensionContextLike["ui"]): UiOwner => {
+    ownerGeneration += 1;
+    const owner = { generation: ownerGeneration, ui };
+    activeOwner = owner;
+    return owner;
+  };
+
+  const setSelection = (next: SelectionState): void => {
+    selectionGeneration += 1;
+    selection = next;
+  };
+
+  const selectionForModel = (model: ModelLike | undefined): SelectionState => {
+    if (!model) return { kind: "inactive", reason: { kind: "no-model" } };
+    const runtime = byProvider.get(model.provider);
+    if (!runtime) {
+      return { kind: "inactive", reason: { kind: "unmanaged", provider: model.provider } };
+    }
+    const target = runtime.targets.find((candidate) => candidate.provider === model.provider);
+    if (!target) {
+      return { kind: "inactive", reason: { kind: "unmanaged", provider: model.provider } };
+    }
+    if (model.api !== target.api) {
+      return {
+        kind: "inactive",
+        reason: {
+          kind: "api-mismatch",
+          poolId: runtime.id,
+          provider: model.provider,
+          configuredApi: target.api,
+          selectedApi: model.api,
+        },
+      };
+    }
+    if (!isEnabled(runtime)) {
+      return { kind: "inactive", reason: { kind: "pool-disabled", poolId: runtime.id } };
+    }
+    return { kind: "active", runtime, target };
+  };
+
+  const captureOwner = (): OwnerToken | undefined =>
+    activeOwner ? { owner: activeOwner, selectionGeneration } : undefined;
+
+  const stillOwns = (token: OwnerToken): boolean =>
+    activeOwner === token.owner && selectionGeneration === token.selectionGeneration;
+
+  const adoptCommandContext = (ctx: ExtensionContextLike): OwnerToken => {
+    if (!activeOwner || activeOwner.ui !== ctx.ui) {
+      beginOwner(ctx.ui);
+      setSelection(selectionForModel(ctx.model));
+    }
+    // beginOwner above or an existing active owner makes this non-null.
+    return captureOwner() as OwnerToken;
+  };
+
+  const commitFooter = (token: OwnerToken, sequence: number, text: string): void => {
+    if (!stillOwns(token) || sequence !== footerSequence) return;
     try {
-      if (active) {
-        const snapshot =
-          provided?.poolId === active.id ? provided.snapshot : await active.pool.snapshot();
-        activeUi.setStatus(STATUS_KEY, concisePoolStatus(active.id, snapshot));
-        return;
-      }
-      activeUi.setStatus(STATUS_KEY, `${pools.length} independent key pools`);
+      token.owner.ui.setStatus(STATUS_KEY, text);
     } catch {
-      try {
-        activeUi.setStatus(STATUS_KEY, active ? `${active.id}: state unavailable` : "state unavailable");
-      } catch {
-        // Footer rendering must never fail a session or command.
-      }
+      // Footer rendering must never fail a session, command, or request.
     }
   };
 
-  const queueFooter = (runtime: RegisteredPool, snapshot: PoolSnapshot): void => {
-    queuedFooter = { poolId: runtime.id, snapshot };
+  const refreshFooter = async (
+    provided?: FooterSnapshot,
+    token = captureOwner(),
+    reservedSequence?: number,
+  ): Promise<void> => {
+    if (!token) return;
+    const sequence = reservedSequence ?? ++footerSequence;
+    const selected = selection;
+    if (selected.kind === "inactive") {
+      commitFooter(token, sequence, inactiveFooter(selected.reason));
+      return;
+    }
+
+    try {
+      const snapshot =
+        provided?.poolId === selected.runtime.id
+          ? provided.snapshot
+          : await selected.runtime.pool.snapshot();
+      // The await above can cross a session, UI, or model change. Both owner
+      // generations and the monotonic footer sequence fence the result.
+      if (!stillOwns(token)) return;
+      commitFooter(token, sequence, concisePoolStatus(selected.runtime.id, snapshot));
+    } catch {
+      if (!stillOwns(token)) return;
+      commitFooter(token, sequence, `${selected.runtime.id}: state unavailable`);
+    }
+  };
+
+  const queueFooter = (runtime: EnabledPool, snapshot: PoolSnapshot, token: OwnerToken): void => {
+    if (!stillOwns(token)) return;
+    queuedFooter = { runtime, snapshot, token };
     if (footerQueued) return;
     footerQueued = true;
     queueMicrotask(() => {
       footerQueued = false;
       const pending = queuedFooter;
       queuedFooter = undefined;
-      if (!pending || !activeUi || activePoolId !== pending.poolId) return;
-      try {
-        activeUi.setStatus(STATUS_KEY, concisePoolStatus(pending.poolId, pending.snapshot));
-      } catch {
-        // Best-effort footer updates never affect provider requests.
-      }
+      if (!pending || !stillOwns(pending.token)) return;
+      const selected = selection;
+      if (selected.kind !== "active" || selected.runtime !== pending.runtime) return;
+      // Coalesce callbacks in callback order. refreshFooter's sequence fence
+      // prevents an older awaited read from overwriting this newer snapshot.
+      void refreshFooter(
+        { poolId: pending.runtime.id, snapshot: pending.snapshot },
+        pending.token,
+      );
     });
   };
 
   const registeredTargets = new Map<string, string>();
-  for (const runtime of pools) {
+  for (const runtime of enabledPools) {
     const firstKey = runtime.config.keys[0];
     if (!firstKey) throw new Error(`Key rotator pool "${runtime.id}" has no resolved API keys.`);
-
-    const rotatingStream = createRotatingStream({
-      config: runtime.config,
-      pool: runtime.pool,
-      baseStreamSimple: dependencies.baseStreamSimple,
-      createEventStream: dependencies.createEventStream,
-      onStateChange: (snapshot) => {
-        if (activePoolId === runtime.id || (pools.length === 1 && !activePoolId)) {
-          queueFooter(runtime, snapshot);
-        }
-      },
-    });
-
     const providerFallback = fallbackApiKey(firstKey);
+
     for (const target of runtime.targets) {
-      byProvider.set(target.provider, runtime);
-      // Pi keeps `streamSimple` per provider. Keep a direct registration and a
-      // target-specific guard instead of Prime's global per-API dispatcher.
-      const guardedStream = ((model, context, options) =>
-        model.provider === target.provider && model.api === target.api
-          ? rotatingStream(model, context, options)
-          : dependencies.baseStreamSimple(model, context, options)) as StreamSimpleLike;
+      // Pi keeps streamSimple per provider. Retain direct target-specific
+      // registrations and pass the original Pi model through unchanged.
+      const guardedStream = ((model, context, options) => {
+        if (model.provider !== target.provider || model.api !== target.api) {
+          return dependencies.baseStreamSimple(model, context, options);
+        }
+
+        const selected = selection;
+        const requestOwner =
+          selected.kind === "active" &&
+          selected.runtime === runtime &&
+          selected.target.provider === target.provider &&
+          selected.target.api === target.api
+            ? captureOwner()
+            : undefined;
+        // A per-request callback closes over the selection/session owner that
+        // launched it. A late provider outcome can never paint a later model.
+        const rotatingStream = createRotatingStream({
+          config: runtime.config,
+          pool: runtime.pool,
+          baseStreamSimple: dependencies.baseStreamSimple,
+          createEventStream: dependencies.createEventStream,
+          ...(requestOwner
+            ? { onStateChange: (snapshot: PoolSnapshot) => queueFooter(runtime, snapshot, requestOwner) }
+            : {}),
+        });
+        return rotatingStream(model, context, options);
+      }) as StreamSimpleLike;
+
       pi.registerProvider(target.provider, {
         api: target.api,
         apiKey: providerFallback,
@@ -191,164 +412,264 @@ export function registerMultiPoolKeyRotatorExtension(
   }
   dependencies.onRegistered?.(new Map(registeredTargets));
 
-  const notifyAllStatuses = async (ctx: ExtensionContextLike): Promise<Map<string, PoolSnapshot>> => {
-    const entries = await Promise.all(
-      pools.map(async (runtime) => {
-        const snapshot = await runtime.pool.snapshot();
-        return { runtime, snapshot };
-      }),
+  type PoolRead =
+    | { runtime: PreparedPool; text: string }
+    | { runtime: EnabledPool; text: string; snapshot: PoolSnapshot };
+
+  const hasSnapshot = (
+    entry: PoolRead,
+  ): entry is { runtime: EnabledPool; text: string; snapshot: PoolSnapshot } =>
+    "snapshot" in entry;
+
+  const readConciseStatus = async (runtime: PreparedPool): Promise<PoolRead> => {
+    if (!isEnabled(runtime)) return { runtime, text: conciseDisabledPoolStatus(runtime) };
+    try {
+      const snapshot = await runtime.pool.snapshot();
+      return { runtime, snapshot, text: concisePoolStatus(runtime.id, snapshot) };
+    } catch (error) {
+      return {
+        runtime,
+        text: `${runtime.id}: state unavailable (${sanitizedStateFailure(error)})`,
+      };
+    }
+  };
+
+  const readDetailedStatus = async (runtime: PreparedPool): Promise<PoolRead> => {
+    if (!isEnabled(runtime)) return { runtime, text: disabledPoolStatus(runtime) };
+    try {
+      const snapshot = await runtime.pool.snapshot();
+      return { runtime, snapshot, text: formatStatus(snapshot, runtime.config) };
+    } catch (error) {
+      return {
+        runtime,
+        text: [
+          `Pool: ${runtime.id}`,
+          "Rotation state: unavailable",
+          `State error: ${sanitizedStateFailure(error)}`,
+        ].join("\n"),
+      };
+    }
+  };
+
+  const notifyAllStatuses = async (
+    token: OwnerToken,
+  ): Promise<Map<string, PoolSnapshot> | undefined> => {
+    const entries = await Promise.all(pools.map(readDetailedStatus));
+    if (!stillOwns(token)) return undefined;
+    token.owner.ui.notify(entries.map((entry) => entry.text).join("\n\n"), "info");
+    return new Map(
+      entries.flatMap((entry) =>
+        "snapshot" in entry ? [[entry.runtime.id, entry.snapshot] as const] : [],
+      ),
     );
-    ctx.ui.notify(
-      entries.map(({ runtime, snapshot }) => formatStatus(snapshot, runtime.config)).join("\n\n"),
-      "info",
-    );
-    return new Map(entries.map(({ runtime, snapshot }) => [runtime.id, snapshot] as const));
   };
 
   const resolveCommandPools = (
     rawSelector: string | undefined,
     allowAll: boolean,
-    ctx: ExtensionContextLike,
-  ): RegisteredPool[] | undefined => {
+    token: OwnerToken,
+  ): EnabledPool[] | undefined => {
     const selector = rawSelector?.trim();
     if (selector?.toLowerCase() === "all") {
-      if (allowAll) return pools;
-      ctx.ui.notify('"all" is not valid for this command.', "warning");
+      if (!allowAll) {
+        token.owner.ui.notify('"all" is not valid for this command.', "warning");
+        return undefined;
+      }
+      const disabled = pools.filter((runtime): runtime is DisabledPool => !isEnabled(runtime));
+      if (disabled.length > 0) {
+        token.owner.ui.notify(
+          `Skipped disabled pool${disabled.length === 1 ? "" : "s"} ${disabled.map((runtime) => `"${runtime.id}"`).join(", ")}; state evidence remains unchanged.`,
+          "warning",
+        );
+      }
+      if (enabledPools.length > 0) return enabledPools;
+      token.owner.ui.notify("No healthy key pools are available for this command.", "warning");
       return undefined;
     }
     if (selector) {
       const selected = findPool(selector);
-      if (selected) return [selected];
-      ctx.ui.notify(`Unknown key pool "${selector}".\n${usage()}`, "warning");
-      return undefined;
+      if (!selected) {
+        token.owner.ui.notify(`Unknown key pool "${selector}".\n${usage()}`, "warning");
+        return undefined;
+      }
+      if (!isEnabled(selected)) {
+        token.owner.ui.notify(
+          `Pool "${selected.id}" is disabled because state preflight failed. Its state evidence was not changed.`,
+          "warning",
+        );
+        return undefined;
+      }
+      return [selected];
     }
-    const active = activePoolId ? findPool(activePoolId) : undefined;
-    if (active) return [active];
-    if (pools.length === 1 && pools[0]) return [pools[0]];
-    ctx.ui.notify("Multiple independent pools are configured; specify a poolId or use all.\n" + usage(), "warning");
+
+    const selected = selection;
+    if (selected.kind === "active") return [selected.runtime];
+    token.owner.ui.notify(
+      `Rotation is inactive because ${inactiveCommandReason(selected.reason)}. ` +
+        "The bare destructive command was refused; specify a poolId or use all explicitly.\n" +
+        usage(),
+      "warning",
+    );
     return undefined;
   };
 
   pi.registerCommand("key-rotator", {
     description: "Inspect, diagnose, advance, or reset independent API key rotation pools",
     handler: async (args, ctx) => {
-      activeUi = ctx.ui;
+      const token = adoptCommandContext(ctx);
+      let commandFooterSequence: number | undefined;
+      const reserveFooter = (): number => {
+        commandFooterSequence ??= ++footerSequence;
+        return commandFooterSequence;
+      };
       try {
         const tokens = args.trim().split(/\s+/).filter(Boolean);
         const action = tokens[0]?.toLowerCase() ?? "status";
         const selector = tokens[1];
         if (tokens.length > 2) {
-          ctx.ui.notify(usage(), "warning");
+          token.owner.ui.notify(usage(), "warning");
           return;
         }
 
         if (action === "doctor") {
           if (selector || !dependencies.doctor) {
-            ctx.ui.notify(usage(), "warning");
+            token.owner.ui.notify(usage(), "warning");
             return;
           }
+          const footerOrder = reserveFooter();
           const report = await dependencies.doctor();
-          ctx.ui.notify(
+          if (!stillOwns(token)) return;
+          token.owner.ui.notify(
             report.text,
             report.severity === "FAIL" ? "error" : report.severity === "WARN" ? "warning" : "info",
           );
-          if (report.severity !== "FAIL") await refreshFooter();
+          if (report.severity !== "FAIL") await refreshFooter(undefined, token, footerOrder);
           return;
         }
 
         if (action === "list") {
-          const entries = await Promise.all(
-            pools.map(async (runtime) => ({ runtime, snapshot: await runtime.pool.snapshot() })),
+          const footerOrder = reserveFooter();
+          const entries = await Promise.all(pools.map(readConciseStatus));
+          if (!stillOwns(token)) return;
+          token.owner.ui.notify(entries.map((entry) => entry.text).join("\n"), "info");
+          const activeRuntime = selection.kind === "active" ? selection.runtime : undefined;
+          const active = activeRuntime
+            ? entries.find((entry) => entry.runtime === activeRuntime && hasSnapshot(entry))
+            : undefined;
+          await refreshFooter(
+            active && hasSnapshot(active)
+              ? { poolId: active.runtime.id, snapshot: active.snapshot }
+              : undefined,
+            token,
+            footerOrder,
           );
-          ctx.ui.notify(
-            entries.map(({ runtime, snapshot }) => concisePoolStatus(runtime.id, snapshot)).join("\n"),
-            "info",
-          );
-          const active = entries.find(({ runtime }) => runtime.id === activePoolId);
-          await refreshFooter(active && { poolId: active.runtime.id, snapshot: active.snapshot });
           return;
         }
 
         if (action === "status") {
-          let footerSnapshot: { poolId: string; snapshot: PoolSnapshot } | undefined;
+          const footerOrder = reserveFooter();
+          let footerSnapshot: FooterSnapshot | undefined;
           if (!selector) {
-            const snapshots = await notifyAllStatuses(ctx);
-            const active = activePoolId ? snapshots.get(activePoolId) : undefined;
-            if (activePoolId && active) footerSnapshot = { poolId: activePoolId, snapshot: active };
+            const snapshots = await notifyAllStatuses(token);
+            if (!stillOwns(token) || !snapshots) return;
+            if (selection.kind === "active") {
+              const active = snapshots.get(selection.runtime.id);
+              if (active) footerSnapshot = { poolId: selection.runtime.id, snapshot: active };
+            }
           } else {
-            const selected = resolveCommandPools(selector, false, ctx);
-            if (!selected) return;
-            const runtime = selected[0];
-            if (!runtime) return;
-            const snapshot = await runtime.pool.snapshot();
-            ctx.ui.notify(formatStatus(snapshot, runtime.config), "info");
-            activePoolId = runtime.id;
-            footerSnapshot = { poolId: runtime.id, snapshot };
+            const selected = findPool(selector);
+            if (!selected) {
+              token.owner.ui.notify(`Unknown key pool "${selector}".\n${usage()}`, "warning");
+              return;
+            }
+            const entry = await readDetailedStatus(selected);
+            if (!stillOwns(token)) return;
+            token.owner.ui.notify(entry.text, isEnabled(selected) ? "info" : "warning");
+            if ("snapshot" in entry) {
+              footerSnapshot = { poolId: entry.runtime.id, snapshot: entry.snapshot };
+            }
           }
-          await refreshFooter(footerSnapshot);
+          await refreshFooter(footerSnapshot, token, footerOrder);
           return;
         }
 
         if (action === "next" || action === "reset") {
-          const selected = resolveCommandPools(selector, true, ctx);
+          const selected = resolveCommandPools(selector, true, token);
           if (!selected) return;
+          const footerOrder = reserveFooter();
           const snapshots = new Map<string, PoolSnapshot>();
           for (const runtime of selected) {
+            if (!stillOwns(token)) return;
             const snapshot = action === "next" ? await runtime.pool.advance() : await runtime.pool.reset();
+            if (!stillOwns(token)) return;
             snapshots.set(runtime.id, snapshot);
-            ctx.ui.notify(
+            token.owner.ui.notify(
               action === "next"
                 ? `Advanced pool "${runtime.id}" to ${snapshot.currentKeyId}.`
                 : `Reset counters, cooldowns, and disabled states for pool "${runtime.id}".`,
               action === "next" ? "info" : "warning",
             );
           }
-          if (selected.length === 1 && selected[0]) activePoolId = selected[0].id;
-          const activeSnapshot = activePoolId ? snapshots.get(activePoolId) : undefined;
+          const activeSnapshot =
+            selection.kind === "active" ? snapshots.get(selection.runtime.id) : undefined;
           await refreshFooter(
-            activePoolId && activeSnapshot ? { poolId: activePoolId, snapshot: activeSnapshot } : undefined,
+            selection.kind === "active" && activeSnapshot
+              ? { poolId: selection.runtime.id, snapshot: activeSnapshot }
+              : undefined,
+            token,
+            footerOrder,
           );
           return;
         }
 
-        ctx.ui.notify(usage(), "warning");
+        token.owner.ui.notify(usage(), "warning");
       } catch {
-        ctx.ui.notify("Key-rotator state operation failed. Run /key-rotator doctor before retrying.", "error");
-        await refreshFooter();
+        if (!stillOwns(token)) return;
+        token.owner.ui.notify(
+          "Key-rotator state operation failed. Run /key-rotator doctor before retrying.",
+          "error",
+        );
+        await refreshFooter(undefined, token, commandFooterSequence ?? reserveFooter());
       }
     },
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    activeUi = ctx.ui;
-    if (ctx.model) activePoolId = byProvider.get(ctx.model.provider)?.id ?? activePoolId;
-    await refreshFooter();
+    beginOwner(ctx.ui);
+    setSelection(selectionForModel(ctx.model));
+    const token = captureOwner();
+    if (token) await refreshFooter(undefined, token);
   });
 
   pi.on("model_select", async (event, ctx) => {
-    activeUi = ctx.ui;
+    if (!activeOwner || activeOwner.ui !== ctx.ui) beginOwner(ctx.ui);
     const model = extractModel(event);
-    const runtime = model ? byProvider.get(model.provider) : undefined;
-    if (runtime && model) {
-      activePoolId = runtime.id;
-      const target = runtime.targets.find((candidate) => candidate.provider === model.provider);
-      if (target && model.api !== target.api) {
-        ctx.ui.notify(
-          `Key pool "${runtime.id}" expects provider "${target.provider}" to use API "${target.api}", ` +
-            `but the selected model uses "${model.api}". Update key-rotator.json or models.json.`,
-          "error",
-        );
-      }
+    const nextSelection = selectionForModel(model);
+    setSelection(nextSelection);
+    const token = captureOwner();
+
+    if (nextSelection.kind === "inactive" && nextSelection.reason.kind === "api-mismatch") {
+      const reason = nextSelection.reason;
+      ctx.ui.notify(
+        `Key pool "${reason.poolId}" expects provider "${reason.provider}" to use API "${reason.configuredApi}", ` +
+          `but the selected model uses "${reason.selectedApi}". Update key-rotator.json or models.json.`,
+        "error",
+      );
     }
-    await refreshFooter();
+    if (token) await refreshFooter(undefined, token);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    if (activeOwner?.ui === ctx.ui) {
+      activeOwner = undefined;
+      selectionGeneration += 1;
+      selection = { kind: "inactive", reason: { kind: "no-model" } };
+      footerSequence += 1;
+    }
     try {
       ctx.ui.setStatus(STATUS_KEY, undefined);
     } catch {
       // Session shutdown must not fail because the footer renderer failed.
     }
-    activeUi = undefined;
   });
 }

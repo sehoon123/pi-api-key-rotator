@@ -109,7 +109,7 @@ export async function startKeyRotator(pi: ExtensionApiLike, options: StartOption
 
   let registeredTargets = new Map<string, string>();
   try {
-    registerMultiPoolKeyRotatorExtension(pi, {
+    await registerMultiPoolKeyRotatorExtension(pi, {
       pools,
       baseStreamSimple: options.baseStreamSimple,
       createEventStream: options.createEventStream,

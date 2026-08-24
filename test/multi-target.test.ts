@@ -73,7 +73,7 @@ test("registers both IBM ICA providers against one shared key pool", async () =>
   };
 
   const pi = new MockPi();
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: baseStream,
@@ -124,7 +124,7 @@ test("an authentication failure on the Claude target disables that key for the O
   };
 
   const pi = new MockPi();
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: baseStream,

@@ -73,7 +73,7 @@ function makeUi() {
 
 const neverCalledStream: StreamSimpleLike = () => new TestEventStream();
 
-test("registers a guarded wrapper with only the inert managed fallback", () => {
+test("registers a guarded wrapper with only the inert managed fallback", async () => {
   const time = mutableClock(100);
   const config = makeConfig();
   const pool = new KeyPool(
@@ -83,7 +83,7 @@ test("registers a guarded wrapper with only the inert managed fallback", () => {
   );
   const pi = new MockPi();
 
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: neverCalledStream,
@@ -111,7 +111,7 @@ test("status, next, and reset commands never display raw API keys", async () => 
   const ui = makeUi();
   const ctx: ExtensionContextLike = { ui: ui.ui };
 
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: neverCalledStream,
@@ -144,7 +144,7 @@ test("model_select warns when the configured API does not match the selected mod
   const ui = makeUi();
   const ctx: ExtensionContextLike = { ui: ui.ui };
 
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: neverCalledStream,
@@ -172,7 +172,7 @@ test("session shutdown clears the footer status", async () => {
   const ui = makeUi();
   const ctx: ExtensionContextLike = { ui: ui.ui };
 
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: neverCalledStream,
@@ -248,7 +248,7 @@ test("the per-provider guard passes mismatched provider and API calls through un
     return new TestEventStream();
   };
 
-  registerKeyRotatorExtension(pi, {
+  await registerKeyRotatorExtension(pi, {
     config,
     pool,
     baseStreamSimple: baseStream,

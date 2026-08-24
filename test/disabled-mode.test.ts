@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -194,6 +194,73 @@ test("active startup injects Pi streams, registers inert auth, and exposes local
     assert.match(ui.notifications.at(-1)?.message ?? "", /openai-completions registered locally/);
     assert.match(ui.notifications.at(-1)?.message ?? "", /no provider requests sent/);
     assert.equal(providerCalls, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+
+test("startup contains one corrupt pool while registering healthy pools", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-key-rotator-partial-state-"));
+  const configFile = join(directory, "key-rotator.json");
+  const primaryState = join(directory, "primary.state.json");
+  const secondaryState = join(directory, "secondary.state.json");
+  const corruptEvidence = '{"malformed-state":';
+  try {
+    await writeFile(
+      configFile,
+      JSON.stringify({
+        pools: [
+          {
+            poolId: "primary",
+            provider: "primary-provider",
+            api: "openai-completions",
+            keys: [
+              { id: "one", value: "primary-secret-one" },
+              { id: "two", value: "primary-secret-two" },
+            ],
+            stateFile: primaryState,
+          },
+          {
+            poolId: "secondary",
+            provider: "secondary-provider",
+            api: "openai-completions",
+            keys: [
+              { id: "one", value: "secondary-secret-one" },
+              { id: "two", value: "secondary-secret-two" },
+            ],
+            stateFile: secondaryState,
+          },
+        ],
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    await writeFile(secondaryState, corruptEvidence, { encoding: "utf8", mode: 0o600 });
+
+    const pi = new MockPi();
+    const result = await startKeyRotator(pi, {
+      ...hostOptions,
+      env: { PI_KEY_ROTATOR_CONFIG: configFile },
+      homeDir: directory,
+      warn: () => {},
+    });
+
+    assert.equal(result, "active");
+    assert.ok(pi.providers.has("primary-provider"));
+    assert.equal(pi.providers.has("secondary-provider"), false);
+    assert.equal(await readFile(secondaryState, "utf8"), corruptEvidence);
+
+    const ui = makeUi();
+    ui.ctx.model = {
+      provider: "secondary-provider",
+      api: "openai-completions",
+      id: "secondary-model",
+    };
+    await pi.emit("session_start", {}, ui.ctx);
+    assert.match(ui.statuses.at(-1)?.text ?? "", /rotation inactive.*secondary.*disabled/i);
+    await pi.commands.get("key-rotator")!.handler("status secondary", ui.ctx);
+    assert.match(ui.notifications.at(-1)?.message ?? "", /evidence is preserved/i);
+    assert.equal(await readFile(secondaryState, "utf8"), corruptEvidence);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
