@@ -73,6 +73,11 @@ test("rejects provider, pool ID, and state-file collisions before runtime", () =
   duplicateState.pools[0]!.stateFile = "same/state.json";
   duplicateState.pools[1]!.stateFile = "same/STATE.json";
   assert.throws(() => resolveConfigSet(duplicateState, RESOLVE_OPTIONS), /same state file/);
+
+  const sidecarCollision = rawPools();
+  sidecarCollision.pools[0]!.stateFile = "same/state.json";
+  sidecarCollision.pools[1]!.stateFile = "same/state.json.lock";
+  assert.throws(() => resolveConfigSet(sidecarCollision, RESOLVE_OPTIONS), /State paths.*collide/);
 });
 
 test("rejects ambiguous top-level fields without exposing literal keys", () => {

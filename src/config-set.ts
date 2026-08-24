@@ -1,58 +1,49 @@
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, normalize, resolve } from "node:path";
 import {
-  ConfigNotFoundError,
   ConfigValidationError,
-  DEFAULT_CONFIG_FILE,
+  POOL_FIELDS,
+  readConfigFileSecurely,
+  rejectUnknownFields,
+  resolveCommandKeys,
   resolveConfig,
+  validateCommandBudget,
+  validateConfigVersion,
+  validatePhysicalStatePaths,
 } from "./config.ts";
+import { expandHome, selectConfigPath } from "./pi-host.ts";
+import type { CommandRunner } from "./pi-host.ts";
 import type { RawRotatorConfig, RotatorConfig, RotatorTarget } from "./types.ts";
 
-const MAX_POOLS = 128;
-const POOL_LEVEL_FIELDS = [
-  "poolId",
-  "provider",
-  "api",
-  "targets",
-  "keys",
-  "requestsPerKey",
-  "maxAttemptsPerRequest",
-  "cooldownMs",
-  "transientCooldownMs",
-  "maxRetryAfterMs",
-  "retryStatuses",
-  "disableStatuses",
-  "cooldownStatuses",
-  "retryNetworkErrors",
-  "stateFile",
-  "lockTimeoutMs",
-  "staleLockMs",
-] as const;
+export const MAX_POOLS = 128;
+const ALL_ROOT_FIELDS = ["configVersion", "pools", ...POOL_FIELDS] as const;
 
 export interface RawMultiPoolConfig {
-  pools: RawRotatorConfig[];
+  configVersion?: 1;
+  pools: Array<Omit<RawRotatorConfig, "configVersion">>;
 }
 
 export interface RotatorConfigSet {
   pools: RotatorConfig[];
   configFile: string;
+  /** Non-fatal config path or POSIX readability warnings. */
+  warning?: string;
 }
 
 export interface LoadConfigSetOptions {
   configFile?: string;
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
+  /** Receives non-fatal path and permission warnings before key commands run. */
+  warn?: (message: string) => void;
+  /** Cancels a running command-backed key during load. */
+  signal?: AbortSignal;
+  /** Injected in tests. Defaults to a real shell command. */
+  runCommand?: CommandRunner;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function expandHome(input: string, homeDir: string): string {
-  if (input === "~") return homeDir;
-  if (input.startsWith("~/") || input.startsWith("~\\")) return resolve(homeDir, input.slice(2));
-  return input;
 }
 
 function resolvePath(input: string, homeDir: string): string {
@@ -103,7 +94,7 @@ function canonicalStateFile(path: string): string {
 function validateSet(pools: RotatorConfig[], configFile: string): void {
   const ids = new Map<string, string>();
   const providers = new Map<string, string>();
-  const stateFiles = new Map<string, string>();
+  const stateFiles = new Map<string, { poolId: string; artifact: string }>();
 
   for (const config of pools) {
     const id = poolId(config);
@@ -129,32 +120,46 @@ function validateSet(pools: RotatorConfig[], configFile: string): void {
       providers.set(target.provider, id);
     }
 
-    const stateKey = canonicalStateFile(config.stateFile);
-    const previousStatePool = stateFiles.get(stateKey);
-    if (previousStatePool) {
-      throw new ConfigValidationError(
-        configFile,
-        `Pools "${previousStatePool}" and "${id}" resolve to the same state file. ` +
-          "Give each independent pool a unique poolId or stateFile.",
-      );
+    const artifacts = [
+      { path: config.stateFile, label: "state file" },
+      { path: `${config.stateFile}.lock`, label: "lock file" },
+      { path: `${config.stateFile}.lock.reclaim`, label: "lock reclaim file" },
+      { path: `${config.stateFile}.bak`, label: "backup file" },
+    ];
+    for (const artifact of artifacts) {
+      const stateKey = canonicalStateFile(artifact.path);
+      const previous = stateFiles.get(stateKey);
+      if (previous) {
+        const sameMainFile = previous.artifact === "state file" && artifact.label === "state file";
+        throw new ConfigValidationError(
+          configFile,
+          sameMainFile
+            ? `Pools "${previous.poolId}" and "${id}" resolve to the same state file. ` +
+                "Give each independent pool a unique poolId or stateFile."
+            : `State paths for pools "${previous.poolId}" and "${id}" collide ` +
+                `(${previous.artifact} and ${artifact.label}). Give each pool a distinct stateFile.`,
+        );
+      }
+      stateFiles.set(stateKey, { poolId: id, artifact: artifact.label });
     }
-    stateFiles.set(stateKey, id);
   }
 }
 
 /** Resolve either the existing single/shared-pool format or a top-level pools[] document. */
 export function resolveConfigSet(
   raw: unknown,
-  options: { configFile: string; env: NodeJS.ProcessEnv; homeDir: string },
+  options: { configFile: string; configRevision?: string; env: NodeJS.ProcessEnv; homeDir: string },
 ): RotatorConfigSet {
   const { configFile } = options;
   if (!isRecord(raw)) {
     throw new ConfigValidationError(configFile, "The root value must be a JSON object.");
   }
+  rejectUnknownFields(raw, ALL_ROOT_FIELDS, "the configuration root", configFile);
+  validateConfigVersion(raw, configFile);
 
   let pools: RotatorConfig[];
   if (Object.hasOwn(raw, "pools")) {
-    const conflicts = POOL_LEVEL_FIELDS.filter((name) => Object.hasOwn(raw, name));
+    const conflicts = POOL_FIELDS.filter((name) => Object.hasOwn(raw, name));
     if (conflicts.length > 0) {
       throw new ConfigValidationError(
         configFile,
@@ -173,6 +178,7 @@ export function resolveConfigSet(
         throw new ConfigValidationError(configFile, `pools[${index}] must be an object.`);
       }
       try {
+        rejectUnknownFields(entry, POOL_FIELDS, "the pool definition", configFile);
         return resolveConfig(entry as unknown as RawRotatorConfig, options);
       } catch (error) {
         if (error instanceof ConfigValidationError) {
@@ -182,7 +188,8 @@ export function resolveConfigSet(
       }
     });
   } else {
-    // Existing v0.1/v0.2 documents remain valid without migration.
+    // Versionless documents remain valid without migration.
+    rejectUnknownFields(raw, ["configVersion", ...POOL_FIELDS], "the configuration root", configFile);
     pools = [resolveConfig(raw as unknown as RawRotatorConfig, options)];
   }
 
@@ -194,17 +201,32 @@ export function resolveConfigSet(
 export async function loadConfigSet(options: LoadConfigSetOptions = {}): Promise<RotatorConfigSet> {
   const env = options.env ?? process.env;
   const homeDir = options.homeDir ?? homedir();
-  const environmentPath = env.PI_KEY_ROTATOR_CONFIG?.trim();
-  const requestedPath = options.configFile ?? (environmentPath ? environmentPath : DEFAULT_CONFIG_FILE);
-  const configFile = resolvePath(requestedPath, homeDir);
+  const selection = selectConfigPath({
+    env,
+    homeDir,
+    ...(options.configFile === undefined ? {} : { configFile: options.configFile }),
+  });
+  const configFile = resolvePath(selection.path, homeDir);
 
-  let text: string;
-  try {
-    text = await readFile(configFile, "utf8");
-  } catch (error) {
-    if (isRecord(error) && error.code === "ENOENT") throw new ConfigNotFoundError(configFile);
-    throw error;
+  const loaded = await readConfigFileSecurely(configFile);
+  const warnings = [selection.warning, loaded.warning].filter(
+    (warning): warning is string => warning !== undefined,
+  );
+  for (const warning of warnings) options.warn?.(warning);
+
+  const set = resolveConfigSet(parseJson(loaded.text, configFile), {
+    configFile,
+    configRevision: loaded.revision,
+    env,
+    homeDir,
+  });
+  await validatePhysicalStatePaths(set.pools, configFile);
+  validateCommandBudget(set.pools, configFile);
+  for (const pool of set.pools) {
+    await resolveCommandKeys(pool, {
+      ...(options.runCommand === undefined ? {} : { runCommand: options.runCommand }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
   }
-
-  return resolveConfigSet(parseJson(text, configFile), { configFile, env, homeDir });
+  return { ...set, ...(warnings.length === 0 ? {} : { warning: warnings.join("\n") }) };
 }

@@ -3,22 +3,42 @@ export interface RotatorTarget {
   api: string;
 }
 
+export type RateLimitScope = "key" | "target" | "pool";
+
 export interface EnvKeyDefinition {
   id: string;
   env: string;
   value?: never;
+  command?: never;
 }
 
 export interface LiteralKeyDefinition {
   id: string;
   value: string;
   env?: never;
+  command?: never;
+}
+
+/**
+ * Opt-in third source: the secret is produced by an external command, so it is
+ * never stored in the config file. The command runs once while the extension
+ * loads. Its trimmed stdout is the secret.
+ */
+export interface CommandKeyDefinition {
+  id: string;
+  command: string;
+  commandTimeoutMs?: number;
+  env?: never;
+  value?: never;
 }
 
 /** A key definition must use exactly one secret source. */
-export type KeyDefinition = EnvKeyDefinition | LiteralKeyDefinition;
+export type KeyDefinition = EnvKeyDefinition | LiteralKeyDefinition | CommandKeyDefinition;
 
 export interface RawRotatorConfig {
+  /** Optional schema marker. Versionless documents remain supported. */
+  configVersion?: 1;
+
   /** Optional stable identifier used for the default state-file name. */
   poolId?: string;
 
@@ -38,19 +58,28 @@ export interface RawRotatorConfig {
   retryStatuses?: number[];
   disableStatuses?: number[];
   cooldownStatuses?: number[];
+  /** Scope used when a status in cooldownStatuses (429 by default) is observed. */
+  rateLimitScope?: RateLimitScope;
+  /** Consecutive transient/network failures before a target circuit opens. */
+  targetFailureThreshold?: number;
   retryNetworkErrors?: boolean;
   stateFile?: string;
   lockTimeoutMs?: number;
   staleLockMs?: number;
+  /** Maximum accepted persisted state size. */
+  maxStateFileBytes?: number;
 }
 
-export type KeySource = "env" | "literal";
+export type KeySource = "env" | "literal" | "command";
 
 export interface ResolvedKeyDefinition {
   id: string;
   /** Optional so pre-v0.2 programmatic configs remain source compatible. */
   source?: KeySource;
   env?: string;
+  /** Set for `source: "command"` keys. Never printed together with a value. */
+  command?: string;
+  commandTimeoutMs?: number;
   value: string;
 }
 
@@ -74,17 +103,31 @@ export interface RotatorConfig {
   retryStatuses: ReadonlySet<number>;
   disableStatuses: ReadonlySet<number>;
   cooldownStatuses: ReadonlySet<number>;
+  /** Resolved configs set this; omitted programmatic configs keep key-scoped cooldowns. */
+  rateLimitScope?: RateLimitScope;
+  /** Resolved configs set this; omitted programmatic configs use 2. */
+  targetFailureThreshold?: number;
   retryNetworkErrors: boolean;
   stateFile: string;
   lockTimeoutMs: number;
   staleLockMs: number;
+  /** Optional for source compatibility with programmatic pre-v0.5 configs. */
+  maxStateFileBytes?: number;
   configFile: string;
+  /** Monotonic filesystem revision used to fence rolling secret changes. */
+  configRevision?: string;
 }
 
 export interface KeyRuntimeState {
+  /** SHA-256 identity only; the secret itself is never persisted. */
+  credentialFingerprint: string | null;
+  /** Filesystem revision that installed credentialFingerprint. */
+  configRevision: string;
   attempts: number;
   successes: number;
   failures: number;
+  /** Highest selected attempt whose outcome controls key health. */
+  lastOutcomeAttempt: number;
   disabled: boolean;
   cooldownUntil: number;
   lastStatus: number | null;
@@ -93,13 +136,32 @@ export interface KeyRuntimeState {
   lastFailureAt: number | null;
 }
 
+export interface TargetRuntimeState {
+  failures: number;
+  consecutiveFailures: number;
+  cooldownUntil: number;
+  lastStatus: number | null;
+  lastFailureAt: number | null;
+  lastSuccessAt: number | null;
+  lastOutcomeAttempt: number;
+}
+
 export interface PoolState {
-  version: 1;
+  magic: "pi-api-key-rotator-state";
+  version: 2;
+  /** Stable configured identity. Prevents one pool from consuming another pool's state. */
+  poolId: string;
+  /** Incremented by reset so completions selected before it can be ignored. */
+  generation: number;
   currentKeyId: string;
   requestsOnCurrent: number;
   totalAttempts: number;
   updatedAt: number;
+  poolCooldownUntil: number;
+  /** Highest successful attempt that can fence an older pool-scoped cooldown. */
+  poolLastSuccessAttempt: number;
   keys: Record<string, KeyRuntimeState>;
+  targets: Record<string, TargetRuntimeState>;
 }
 
 export interface SelectedKey {
@@ -110,9 +172,24 @@ export interface SelectedKey {
   value: string;
   ordinal: number;
   attemptNumber: number;
+  /** Provider target whose circuit was checked for this selection. */
+  targetId: string;
+  /** Credential identity used to reject stale rolling-config outcomes. */
+  credentialFingerprint: string;
+  /** Pool generation captured atomically with this attempt selection. */
+  epoch: number;
+  /** Post-selection view from the same state transaction. */
+  snapshot: PoolSnapshot;
 }
 
-export interface KeyStatusSnapshot extends KeyRuntimeState {
+export interface SelectionResult {
+  selected: SelectedKey | null;
+  /** Post-selection (or no-selection) view from the same state transaction. */
+  snapshot: PoolSnapshot;
+}
+
+export interface KeyStatusSnapshot
+  extends Omit<KeyRuntimeState, "credentialFingerprint" | "configRevision" | "lastOutcomeAttempt"> {
   id: string;
   /** Optional for compatibility with state snapshots created before v0.2. */
   source?: KeySource;
@@ -121,13 +198,22 @@ export interface KeyStatusSnapshot extends KeyRuntimeState {
   available: boolean;
 }
 
+export interface TargetStatusSnapshot extends TargetRuntimeState {
+  id: string;
+  available: boolean;
+}
+
 export interface PoolSnapshot {
+  /** Optional so callers constructing legacy snapshots remain source compatible. */
+  generation?: number;
   currentKeyId: string;
   requestsOnCurrent: number;
   requestsPerKey: number;
   totalAttempts: number;
   updatedAt: number;
+  poolCooldownUntil: number;
   keys: KeyStatusSnapshot[];
+  targets: TargetStatusSnapshot[];
 }
 
 export interface ProviderResponseLike {
@@ -152,6 +238,7 @@ export interface StreamOptionsLike {
   apiKey?: string;
   maxRetries?: number;
   maxRetryDelayMs?: number;
+  /** Pi 0.84.2 headers may use null to suppress a provider default. */
   headers?: Record<string, string | null>;
   onPayload?: (payload: unknown, model: ModelLike) => unknown | undefined | Promise<unknown | undefined>;
   onResponse?: (response: ProviderResponseLike, model: ModelLike) => void | Promise<void>;

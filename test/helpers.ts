@@ -102,11 +102,14 @@ export function makeConfig(overrides: Partial<RotatorConfig> = {}): RotatorConfi
     retryStatuses: new Set([401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504]),
     disableStatuses: new Set([401, 402, 403]),
     cooldownStatuses: new Set([429]),
+    rateLimitScope: "key",
+    targetFailureThreshold: 2,
     retryNetworkErrors: true,
     stateFile: "/tmp/pi-key-rotator-test-state.json",
     lockTimeoutMs: 5_000,
     staleLockMs: 30_000,
     configFile: "/tmp/pi-key-rotator-test-config.json",
+    configRevision: "0",
     ...overrides,
   };
 }

@@ -107,13 +107,13 @@ test("rejects a key definition containing both env and value", () => {
     ),
   );
 
-  assert.match(error.message, /exactly one of "env" or "value"/);
+  assert.match(error.message, /exactly one of "env", "value", or "command"/);
   assert.doesNotMatch(error.message, /sk-must-not-leak|environment-secret/);
 });
 
 test("rejects a key definition containing neither env nor value", () => {
   const error = captureValidationError(() => resolve(base([{ id: "invalid" }, { id: "valid", value: "second" }])));
-  assert.match(error.message, /exactly one of "env" or "value"/);
+  assert.match(error.message, /exactly one of "env", "value", or "command"/);
 });
 
 test("treats an explicitly supplied null value as invalid", () => {
@@ -162,6 +162,15 @@ test("rejects control characters in literal keys", () => {
   assert.ok(!error.message.includes(secret));
 });
 
+test("rejects malformed Unicode secrets without echoing them", () => {
+  const secret = `sk-malformed-\uD800-value`;
+  const error = captureValidationError(() =>
+    resolve(base([{ id: "invalid", value: secret }, { id: "valid", value: "second" }])),
+  );
+  assert.match(error.message, /well-formed Unicode/);
+  assert.equal(error.message.includes(secret), false);
+});
+
 test("rejects duplicate literal secrets without printing the secret", () => {
   const secret = "sk-duplicate-literal";
   const error = captureValidationError(() =>
@@ -208,7 +217,7 @@ test("accepts a UTF-8 BOM commonly added by Windows editors", async () => {
       { id: "one", value: "sk-one" },
       { id: "two", value: "sk-two" },
     ]);
-    await writeFile(configFile, `\uFEFF${JSON.stringify(document)}`, "utf8");
+    await writeFile(configFile, `\uFEFF${JSON.stringify(document)}`, { encoding: "utf8", mode: 0o600 });
 
     const config = await loadConfig({ configFile, env: {}, homeDir: directory });
     assert.equal(config.keys[0]?.value, "sk-one");
@@ -225,7 +234,7 @@ test("sanitizes malformed JSON errors so source excerpts cannot leak a literal k
     await writeFile(
       configFile,
       `{"provider":"test","api":"openai-completions","keys":[{"id":"one","value":"${secret}"},]}`,
-      "utf8",
+      { encoding: "utf8", mode: 0o600 },
     );
 
     await assert.rejects(
@@ -248,6 +257,6 @@ test("rejects pathologically large literal values without echoing them", () => {
   const error = captureValidationError(() =>
     resolve(base([{ id: "invalid", value: secret }, { id: "valid", value: "second" }])),
   );
-  assert.match(error.message, /maximum supported length/);
+  assert.match(error.message, /character or UTF-8 byte limit/);
   assert.ok(!error.message.includes(secret.slice(0, 64)));
 });
