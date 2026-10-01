@@ -122,6 +122,22 @@ ceiling is required, set Pi `retry.enabled` to `false` in settings until a pinne
 and the integration suite proves a safe final-error mechanism. Keep
 `retry.provider.maxRetries: 0` as well.
 
+### Development recovery policy
+
+The package entry now injects Pi's public `isContextOverflow` and `isRetryableAssistantError`
+classifiers into the host-free wrapper. An HTTP 200 handshake does not make a pre-semantic body
+failure successful. A recognized transient terminal, iterator failure, or missing terminal can
+follow network failover without overriding a reliable HTTP failure or replaying visible output.
+
+Recognized input overflow before output, with no conflicting auth/transient status, receives the
+canonical `context_length_exceeded` marker. Pi may compact and retry the changed input through its
+bounded recovery policy. Other finalized errors remain retry-neutral. Minimal sanitized failure
+metadata is stored in non-context custom entries and exposed through `/key-rotator errors`.
+
+`test/current-host-recovery.integration.mjs` additionally exercises these paths through an installed
+Pi 0.99.1 loader and real loopback HTTP adapters. This is a targeted recovery check, not a substitute
+for the full host-upgrade checklist below.
+
 ## 8. State and cross-process ownership
 
 State v2 uses Pi-specific magic `pi-api-key-rotator-state`, the exact pool id, generation epochs,

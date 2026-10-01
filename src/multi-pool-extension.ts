@@ -5,6 +5,7 @@ import {
   MANAGED_KEY_PLACEHOLDER,
   STATUS_KEY,
 } from "./extension.ts";
+import { installRotatorErrorReporting } from "./error-reporting.ts";
 import type { KeyPool } from "./key-pool.ts";
 import { installManagedRequestFence } from "./request-fence.ts";
 import type { ManagedRequestTarget, RegistrationEvidence } from "./request-fence.ts";
@@ -15,6 +16,7 @@ import type {
   ExtensionContextLike,
   ModelLike,
   PoolSnapshot,
+  ProviderErrorPolicy,
   RotatorConfig,
   RotatorTarget,
   StreamSimpleLike,
@@ -29,6 +31,7 @@ export interface RegisterMultiPoolDependencies {
   pools: PoolRuntime[];
   baseStreamSimple: StreamSimpleLike;
   createEventStream: EventStreamFactory;
+  errorPolicy?: ProviderErrorPolicy | undefined;
   /** Called after healthy provider registrations are queued locally. */
   onRegistered?: (targets: ReadonlyMap<string, string>) => void;
   /** Local-only operational report. It must not make provider requests. */
@@ -228,6 +231,7 @@ function usage(): string {
     "  /key-rotator status [poolId]",
     "  /key-rotator list",
     "  /key-rotator doctor",
+    "  /key-rotator errors [poolId]",
     "  /key-rotator next <poolId|all>",
     "  /key-rotator reset <poolId|all>",
   ].join("\n");
@@ -418,6 +422,7 @@ export async function registerMultiPoolKeyRotatorExtension(
           pool: runtime.pool,
           baseStreamSimple: dependencies.baseStreamSimple,
           createEventStream: dependencies.createEventStream,
+          errorPolicy: dependencies.errorPolicy,
           ...(requestOwner
             ? { onStateChange: (snapshot: PoolSnapshot) => queueFooter(runtime, snapshot, requestOwner) }
             : {}),
@@ -442,6 +447,7 @@ export async function registerMultiPoolKeyRotatorExtension(
   }
   dependencies.onRegistered?.(new Map(registeredTargets));
   const requestFence = installManagedRequestFence(pi, managedTargets);
+  const errorReporter = installRotatorErrorReporting(pi, pools.map((runtime) => runtime.config));
 
   type PoolRead =
     | { runtime: PreparedPool; text: string }
@@ -562,6 +568,15 @@ export async function registerMultiPoolKeyRotatorExtension(
           return;
         }
 
+        if (action === "errors") {
+          if (selector && !findPool(selector)) {
+            token.owner.ui.notify(`Unknown key pool "${selector}".\n${usage()}`, "warning");
+            return;
+          }
+          errorReporter.show(ctx, selector);
+          return;
+        }
+
         if (action === "doctor") {
           if (selector || !dependencies.doctor) {
             token.owner.ui.notify(usage(), "warning");
@@ -666,6 +681,7 @@ export async function registerMultiPoolKeyRotatorExtension(
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    errorReporter.restore(ctx);
     beginOwner(ctx.ui);
     setSelection(selectionForModel(ctx.model));
     const token = captureOwner();

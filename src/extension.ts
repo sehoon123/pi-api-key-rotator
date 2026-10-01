@@ -1,3 +1,4 @@
+import { installRotatorErrorReporting } from "./error-reporting.ts";
 import type { KeyPool } from "./key-pool.ts";
 import { installManagedRequestFence } from "./request-fence.ts";
 import type { ManagedRequestTarget } from "./request-fence.ts";
@@ -8,6 +9,7 @@ import type {
   ExtensionContextLike,
   ModelLike,
   PoolSnapshot,
+  ProviderErrorPolicy,
   ResolvedKeyDefinition,
   RotatorConfig,
   RotatorTarget,
@@ -21,6 +23,7 @@ export interface RegisterExtensionDependencies {
   pool: KeyPool;
   baseStreamSimple: StreamSimpleLike;
   createEventStream: EventStreamFactory;
+  errorPolicy?: ProviderErrorPolicy | undefined;
 }
 
 type InactiveReason =
@@ -342,6 +345,7 @@ export async function registerKeyRotatorExtension(
           pool,
           baseStreamSimple: dependencies.baseStreamSimple,
           createEventStream: dependencies.createEventStream,
+          errorPolicy: dependencies.errorPolicy,
           ...(requestOwner
             ? { onStateChange: (snapshot: PoolSnapshot) => queueFooter(snapshot, requestOwner) }
             : {}),
@@ -363,6 +367,7 @@ export async function registerKeyRotatorExtension(
     }
   }
   installManagedRequestFence(pi, managedTargets);
+  const errorReporter = installRotatorErrorReporting(pi, [config]);
 
   pi.registerCommand("key-rotator", {
     description: "Show, advance, or reset the shared API key rotation pool",
@@ -376,6 +381,10 @@ export async function registerKeyRotatorExtension(
       try {
         const action = args.trim().toLowerCase() || "status";
 
+        if (action === "errors") {
+          errorReporter.show(ctx);
+          return;
+        }
         if (action === "status") {
           const footerOrder = reserveFooter();
           if (preflightFailure !== undefined) {
@@ -420,7 +429,7 @@ export async function registerKeyRotatorExtension(
           return;
         }
 
-        token.owner.ui.notify("Usage: /key-rotator [status|next|reset]", "warning");
+        token.owner.ui.notify("Usage: /key-rotator [status|errors|next|reset]", "warning");
       } catch {
         if (!stillOwns(token)) return;
         token.owner.ui.notify(
@@ -433,6 +442,7 @@ export async function registerKeyRotatorExtension(
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    errorReporter.restore(ctx);
     beginOwner(ctx.ui);
     setSelection(selectionForModel(ctx.model));
     const token = captureOwner();

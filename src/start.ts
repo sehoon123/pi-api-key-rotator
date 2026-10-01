@@ -15,6 +15,7 @@ import type {
   EventStreamFactory,
   ExtensionApiLike,
   PoolState,
+  ProviderErrorPolicy,
   StreamSimpleLike,
 } from "./types.ts";
 
@@ -25,6 +26,7 @@ export interface StartOptions {
   baseStreamSimple: StreamSimpleLike;
   /** Pi's public assistant-message event-stream factory. */
   createEventStream: EventStreamFactory;
+  errorPolicy?: ProviderErrorPolicy | undefined;
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
   /** Diagnostic sink. Defaults to console.warn. */
@@ -112,6 +114,7 @@ export async function startKeyRotator(pi: ExtensionApiLike, options: StartOption
       pools,
       baseStreamSimple: options.baseStreamSimple,
       createEventStream: options.createEventStream,
+      errorPolicy: options.errorPolicy,
       doctor: async (registrations) =>
         buildDoctorReport({
           configFile: configSet.configFile,

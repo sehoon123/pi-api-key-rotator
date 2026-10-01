@@ -8,6 +8,7 @@ import type {
   ModelLike,
   PoolSnapshot,
   ProviderResponseLike,
+  ProviderErrorPolicy,
   RotatorConfig,
   StreamOptionsLike,
   StreamSimpleLike,
@@ -18,6 +19,7 @@ export interface RotatingStreamDependencies {
   pool: KeyPool;
   baseStreamSimple: StreamSimpleLike;
   createEventStream: EventStreamFactory;
+  errorPolicy?: ProviderErrorPolicy | undefined;
   onStateChange?: (snapshot: PoolSnapshot) => void | Promise<void>;
 }
 
@@ -33,6 +35,8 @@ interface AttemptResult {
   started?: boolean;
   /** Latest caller-visible partial, used to preserve content in a synthetic terminal. */
   partialMessage?: AssistantMessageLike;
+  /** Only a pre-semantic, non-auth/non-transient overflow may reach Pi recovery. */
+  contextOverflow?: boolean;
 }
 
 type DiagnosticDecision =
@@ -85,6 +89,7 @@ function finalizeErrorMessage(
   summary: string,
   config?: RotatorConfig,
   detail?: string,
+  contextOverflow = false,
 ): void {
   const redactor = config ? createErrorRedactor(config) : undefined;
   const safe = (value: string): string =>
@@ -100,15 +105,16 @@ function finalizeErrorMessage(
       error: { name: "PiKeyRotatorFinalized", message: safeSummary },
       details: {
         source: PACKAGE_NAME,
-        reason,
+        reason: contextOverflow ? "context_overflow" : reason,
         ...(safeDetail === undefined ? {} : { detail: safeDetail }),
       },
     },
   ];
-  // Pi 0.84.x classifies retryability from errorMessage text alone. Keep all
-  // provider detail in the bounded diagnostic above and expose a stable phrase
-  // that is deliberately neutral under isRetryableAssistantError().
-  error.errorMessage = FINAL_ERROR_MESSAGE;
+  // Pi classifies recovery from errorMessage, not diagnostics. Preserve a
+  // recognized overflow marker so it can compact the input, but keep finalized
+  // rotation/transport failures neutral to avoid replaying output or bypassing
+  // the wrapper's attempt budget with a second, agent-level retry loop.
+  error.errorMessage = contextOverflow ? "context_length_exceeded" : FINAL_ERROR_MESSAGE;
 }
 
 function emitSyntheticError(
@@ -307,6 +313,11 @@ function sanitizeText(text: string, redactor: ErrorRedactor): string {
   return `${visiblePrefix}${marker}`;
 }
 
+/** Apply the same credential redaction before rendering or persisting reports. */
+export function sanitizeRotatorErrorText(text: string, config: RotatorConfig): string {
+  return sanitizeText(text, createErrorRedactor(config));
+}
+
 function safeErrorText(
   error: unknown,
   config: RotatorConfig,
@@ -438,7 +449,11 @@ function sanitizeAssistantErrorMessage(value: unknown, config: RotatorConfig): u
   return cloned;
 }
 
-function sanitizeForwardedEvent(event: AssistantEventLike, config: RotatorConfig): AssistantEventLike {
+function sanitizeForwardedEvent(
+  event: AssistantEventLike,
+  config: RotatorConfig,
+  contextOverflow = false,
+): AssistantEventLike {
   if (!isErrorTerminal(event)) return event;
   const originalDetail = safeErrorText(event, config);
   const error = sanitizeAssistantErrorMessage(event.error, config);
@@ -448,6 +463,8 @@ function sanitizeForwardedEvent(event: AssistantEventLike, config: RotatorConfig
       "provider_terminal_finalized",
       originalDetail,
       config,
+      undefined,
+      contextOverflow,
     );
   }
   // Error event envelope names are protocol, not diagnostic data. Rebuilding it
@@ -459,8 +476,9 @@ function forwardEvent(
   output: AssistantEventStreamLike,
   event: AssistantEventLike,
   config: RotatorConfig,
+  contextOverflow = false,
 ): void {
-  output.push(sanitizeForwardedEvent(event, config));
+  output.push(sanitizeForwardedEvent(event, config, contextOverflow));
 }
 
 
@@ -592,6 +610,7 @@ function forwardFinalTerminal(
   event: AssistantEventLike,
   response: ProviderResponseLike | undefined,
   config: RotatorConfig,
+  contextOverflow = false,
 ): void {
   const terminalDetail = isErrorTerminal(event) ? safeErrorText(event, config) : undefined;
   const looksLikeHostAuthFailure =
@@ -624,7 +643,7 @@ function forwardFinalTerminal(
     );
     return;
   }
-  forwardEvent(output, event, config);
+  forwardEvent(output, event, config, contextOverflow);
 }
 
 function tokenOccurrence(value: string, token: string, cursor: number): number {
@@ -750,6 +769,7 @@ async function runAttempt(
   const pendingEvents: AssistantEventLike[] = [];
   let forwardedAny = false;
   let latestPartial: AssistantMessageLike | undefined;
+  let contextOverflow = false;
   let callbackFailure: { name: "onPayload" | "onResponse"; error: unknown } | undefined;
 
   const forwardOne = (event: AssistantEventLike): void => {
@@ -787,6 +807,14 @@ async function runAttempt(
       // Some adapters (notably Codex in pi-ai 0.84.x) report their own internal
       // attempts. Until output commits, the newest physical response wins.
       decision = deps.config.retryStatuses.has(received.status) ? "retry" : "forward";
+    }
+  };
+  const discardTentativeSuccess = (): void => {
+    // An HTTP handshake is not a completed streamed response. A body that
+    // breaks or ends before semantic output is still eligible for failover.
+    if (!forwardedAny && response && response.status >= 200 && response.status < 400) {
+      response = undefined;
+      decision = deps.config.retryNetworkErrors ? undefined : "forward";
     }
   };
   const configuredFetch = options?.fetch;
@@ -905,6 +933,30 @@ async function runAttempt(
             }
           }
         }
+        const failure = event.error as AssistantMessageLike;
+        const tentativeSuccess = response !== undefined && response.status >= 200 && response.status < 400;
+        if (
+          !forwardedAny &&
+          !partialHasSemanticContent(failure) &&
+          failure.stopReason === "error" &&
+          diagnostic?.kind !== "network" &&
+          (response === undefined || tentativeSuccess || response.status === 400 || response.status === 413) &&
+          deps.errorPolicy?.isContextOverflow(failure)
+        ) {
+          contextOverflow = true;
+          // This is a deterministic input failure, not a credential/transport
+          // verdict. Do not rotate keys or open the target circuit.
+          if (response === undefined || tentativeSuccess) response = { status: 400, headers: {} };
+          decision = "forward";
+        } else if (
+          tentativeSuccess &&
+          deps.errorPolicy?.isRetryableAssistantError(failure)
+        ) {
+          // Plain SDK transport errors may have no structured diagnostic even
+          // on newer hosts. Do not let an earlier HTTP 200 hide this failure.
+          response = undefined;
+          if (!forwardedAny) decision = deps.config.retryNetworkErrors ? undefined : "forward";
+        }
       } else if (decision === undefined) {
         decision = "forward";
       }
@@ -922,6 +974,7 @@ async function runAttempt(
           outcome: "forwarded",
           response,
           terminalEvent,
+          contextOverflow,
           started: forwardedAny,
           ...heldPending(),
           ...(isErrorTerminal(terminalEvent) ? { error: terminalEvent } : {}),
@@ -929,6 +982,7 @@ async function runAttempt(
       }
     }
     if (options?.signal?.aborted) return { outcome: "aborted", response, error, started: forwardedAny, ...heldPartial() };
+    discardTentativeSuccess();
     if (decision === "forward" || forwardedAny) {
       return { outcome: "forwarded", response, error, started: forwardedAny, ...heldPartial(), ...heldPending() };
     }
@@ -951,6 +1005,7 @@ async function runAttempt(
         outcome: "forwarded",
         response,
         terminalEvent,
+        contextOverflow,
         started: forwardedAny,
         ...heldPending(),
         ...(isErrorTerminal(terminalEvent) ? { error: terminalEvent } : {}),
@@ -973,6 +1028,7 @@ async function runAttempt(
   if (options?.signal?.aborted) return { outcome: "aborted", response, started: forwardedAny, ...heldPartial() };
 
   const error = new Error("Provider stream ended without a terminal event");
+  discardTentativeSuccess();
   if (decision === "forward" || forwardedAny || !deps.config.retryNetworkErrors) {
     return { outcome: "forwarded", response, error, started: forwardedAny, ...heldPartial(), ...heldPending() };
   }
@@ -1101,7 +1157,9 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
             forwardEvent(output, pending, errorConfig);
           }
           if (result.terminalEvent) {
-            forwardFinalTerminal(output, model, result.terminalEvent, result.response, errorConfig);
+            forwardFinalTerminal(
+              output, model, result.terminalEvent, result.response, errorConfig, result.contextOverflow,
+            );
           } else {
             emitSyntheticError(
               output,

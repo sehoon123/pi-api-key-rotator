@@ -245,6 +245,12 @@ export interface StreamOptionsLike {
   [key: string]: unknown;
 }
 
+/** Host classifiers are injected so recovery follows the running Pi version. */
+export interface ProviderErrorPolicy {
+  isContextOverflow(message: AssistantMessageLike): boolean;
+  isRetryableAssistantError(message: AssistantMessageLike): boolean;
+}
+
 export interface UsageLike {
   input: number;
   output: number;
@@ -323,10 +329,13 @@ export interface ExtensionContextLike {
     } | undefined;
     getRegisteredNativeProvider?(provider: string): unknown;
   };
+  sessionManager?: { getEntries(): readonly unknown[] };
   abort?: () => void;
 }
 
 export interface ExtensionApiLike {
+  /** Non-context session metadata, used for bounded, sanitized failure reports. */
+  appendEntry?(customType: string, data: unknown): void;
   registerProvider(
     name: string,
     config: {
@@ -346,6 +355,7 @@ export interface ExtensionApiLike {
     event:
       | "session_start"
       | "model_select"
+      | "message_end"
       | "session_shutdown"
       | "input"
       | "turn_start"

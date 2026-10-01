@@ -275,6 +275,21 @@ Once semantic content is forwarded, events use low-latency streaming and automat
 the source then fails, the wrapper emits one terminal for that invocation instead of replaying the
 request and risking duplicate text or tool calls.
 
+### Recovery and final-error diagnostics
+
+The package entry injects the running Pi version's public error classifiers. An HTTP `200`
+handshake is tentative: a transient failure, broken body iterator, or missing terminal before
+semantic output can fail over within the existing network policy, target circuit, and attempt budget.
+
+A recognized input/context overflow before output is exposed as `context_length_exceeded` so Pi can
+compact the input and perform its bounded recovery. Authentication failures, conflicting HTTP
+statuses, and failures after visible output do not enter this recovery path. Other finalized errors
+keep a retry-neutral message to avoid replaying output or starting another agent-level retry loop.
+
+The sanitized cause is shown in a UI notification and `/key-rotator errors`. Up to ten recent reports
+are retained in memory and restored from minimal, non-context session metadata on reload. Reports
+exclude prompts, assistant content, headers, stacks, and complete provider diagnostics.
+
 ### Durable terminal gate
 
 The final `done` or `error` event is held until the success/failure transaction commits to state. If
@@ -292,6 +307,7 @@ attempt limit is required.
 | `/key-rotator status [poolId]` | full status of all pools, or one pool |
 | `/key-rotator list` | one compact line per pool |
 | `/key-rotator doctor` | read-only config, state, lock, and post-bind registration checks; sends no request |
+| `/key-rotator errors [poolId]` | show the latest ten sanitized failure reports from this session; sends no request |
 | `/key-rotator next <poolId\|all>` | advance the current key |
 | `/key-rotator reset <poolId\|all>` | clear health/counters and increment the state generation |
 
@@ -423,6 +439,7 @@ zero and review the separate agent-level retry setting.
 | duplicate extension/provider registration | the request fence and doctor fail after the competing registration is observed; remove duplicate copies and run `/reload` |
 | managed request is refused before dispatch | the selected model API differs, pool preflight failed, or Pi did not retain the exact rotator registration; fix the cause, then run `/reload` |
 | managed provider sends an unrotated fallback | stop immediately; a trusted component bypassed or ignored the verified Pi 0.84.2 extension pipeline |
+| `The credential rotator stopped this request. Review diagnostics for details.` | inspect the cause shown in the notification or run `/key-rotator errors`; genuine budget, credential, or state failures still stop safely |
 | `No rotation entry is currently available (...)` | key, target, or pool scope is unavailable; inspect status |
 | `Credential failover exhausted N attempt(s)` | wrapper budget ended or a target/pool circuit stopped selection; Pi may still have an outer retry |
 | state corruption/security/size error | state failed closed; use recovery, not reset |
@@ -464,6 +481,17 @@ npm run test:coverage
 npm run test:package
 npm run test:host
 ```
+
+Additional targeted recovery tests can use an installed Pi **0.99.1** host:
+
+```bash
+PI_ROTATOR_HOST_ROOT=/absolute/path/to/pi-coding-agent \
+  node --test test/current-host-recovery.integration.mjs
+```
+
+These use fake credentials and loopback HTTP servers to check loading, failover, context recovery,
+final-error budgets, and API fencing. They do not declare full compatibility beyond the pinned
+release contract above.
 
 The two Pi core packages are wildcard peers because Pi supplies them to installed extensions. The
 lockfile pins exact development and contract-test copies to 0.84.2. CI also runs Ubuntu and Windows

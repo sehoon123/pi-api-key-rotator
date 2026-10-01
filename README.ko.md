@@ -270,6 +270,21 @@ semantic content를 전달한 뒤에는 low-latency streaming을 유지하고 au
 source가 실패하면 request를 반복하여 text/tool call을 중복시키지 않고 그 wrapper invocation의 terminal을
 하나 보냅니다.
 
+### 복구와 최종 오류 진단
+
+package entry는 실행 중인 Pi의 public 오류 분류 함수를 주입합니다. HTTP `200` 연결 성공은 아직
+완료된 응답이 아닙니다. semantic output 전에 일시적 오류, body iterator 단절, terminal 누락이 발생하면
+기존 network 정책, target circuit, attempt budget 범위 안에서 failover합니다.
+
+출력 전에 확인한 입력/context 초과는 `context_length_exceeded`로 전달하여 Pi가 입력을 압축하고
+bounded recovery를 수행할 수 있게 합니다. 인증 오류, 상충하는 HTTP status, 이미 출력이 보인 뒤의 오류는
+이 복구 경로에 넣지 않습니다. 나머지 최종 오류는 retry-neutral 문구를 유지하여 중복 출력과 별도
+agent-level retry loop를 막습니다.
+
+정제된 원인은 UI 알림과 `/key-rotator errors`에서 확인합니다. 최근 보고서 10개를 memory에 유지하고,
+최소한의 non-context session metadata로 저장하여 reload 때 복원합니다. 보고서에는 prompt, assistant
+content, header, stack, 전체 provider diagnostics를 저장하지 않습니다.
+
 ### Durable terminal gate
 
 최종 `done` 또는 `error` event는 success/failure transaction이 state에 commit될 때까지 보류합니다. commit이
@@ -287,6 +302,7 @@ Pi 0.84.2는 최종 provider-like error를 별도로 agent-level retry할 수 �
 | `/key-rotator status [poolId]` | 모든 pool 또는 한 pool의 전체 상태. |
 | `/key-rotator list` | pool마다 한 줄 요약. |
 | `/key-rotator doctor` | read-only config/state/lock/post-bind registration 점검. provider 요청 없음. |
+| `/key-rotator errors [poolId]` | 해당 session의 최근 정제된 오류 보고서 10개 확인. provider 요청 없음. |
 | `/key-rotator next <poolId\|all>` | current key를 다음으로 이동. |
 | `/key-rotator reset <poolId\|all>` | health/counter를 지우고 state generation 증가. |
 
@@ -424,6 +440,7 @@ upstream log를 보호하고 credential을 다룰 때 provider debug logging을 
 | duplicate extension/provider registration | competing registration을 관찰하면 request fence와 doctor가 실패함. duplicate copy를 제거하고 `/reload` 실행. |
 | managed request가 dispatch 전에 거부됨 | selected model API mismatch, pool preflight 실패, 또는 Pi가 정확한 rotator registration을 유지하지 않음. 원인을 수정하고 `/reload` 실행. |
 | managed provider가 rotation 없이 fallback 전송 | 즉시 중단. trusted component가 검증된 Pi 0.84.2 extension pipeline을 bypass했거나 cancellation을 무시함. |
+| `The credential rotator stopped this request. Review diagnostics for details.` | 알림 또는 `/key-rotator errors`에서 실제 원인 확인. budget, credential, state의 실제 실패는 계속 안전하게 중단. |
 | `No rotation entry is currently available (...)` | key, target, pool scope 중 하나가 unavailable. status 확인. |
 | `Credential failover exhausted N attempt(s)` | wrapper budget 소진 또는 target/pool circuit 중단. Pi outer retry는 별도일 수 있음. |
 | state corruption/security/size error | fail closed 상태. reset이 아니라 복구 절차 사용. |
@@ -464,6 +481,16 @@ npm run test:coverage
 npm run test:package
 npm run test:host
 ```
+
+설치된 Pi **0.99.1** host로 targeted recovery test를 추가 실행할 수 있습니다.
+
+```bash
+PI_ROTATOR_HOST_ROOT=/absolute/path/to/pi-coding-agent \
+  node --test test/current-host-recovery.integration.mjs
+```
+
+가짜 credential과 loopback HTTP 서버로 loading, failover, context recovery, 최종 오류 budget,
+API fence를 검증합니다. 위 pinned release contract를 넘어서는 전체 호환성 선언은 아닙니다.
 
 Pi core package 두 개는 installed extension에 Pi가 제공하므로 wildcard peer입니다. lockfile은 development와
 contract test용 copy를 정확한 0.84.2로 고정합니다. CI는 Ubuntu/Windows와 Node 22.19/24를 실행합니다.
