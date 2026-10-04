@@ -58,13 +58,15 @@ const hostOptions = {
   createEventStream: () => new TestEventStream(),
 };
 
-test("a missing configuration file registers an explaining command and never throws", async () => {
+test("a missing configuration uses Pi's host-resolved agent directory", async () => {
   const homeDir = await mkdtemp(join(tmpdir(), "pi-key-rotator-missing-"));
+  const agentDir = join(homeDir, "host-agent");
   try {
     const pi = new MockPi();
     const warnings: string[] = [];
     const result = await startKeyRotator(pi, {
       ...hostOptions,
+      agentDir,
       env: {},
       homeDir,
       warn: (message) => warnings.push(message),
@@ -78,8 +80,12 @@ test("a missing configuration file registers an explaining command and never thr
     const ui = makeUi();
     await command.handler("status", ui.ctx);
     assert.equal(ui.notifications.at(-1)?.type, "error");
-    assert.match(ui.notifications.at(-1)?.message ?? "", /Configuration is missing at/);
-    assert.match(ui.notifications.at(-1)?.message ?? "", /run \/reload/);
+    const message = ui.notifications.at(-1)?.message ?? "";
+    assert.match(message, /Configuration is missing at/);
+    assert.ok(message.includes(join(agentDir, "key-rotator.json")));
+    assert.ok(!message.includes(join(homeDir, ".pi", "agent", "key-rotator.json")));
+    assert.match(message, /PI_CODING_AGENT_DIR or PI_KEY_ROTATOR_CONFIG/);
+    assert.match(message, /run \/reload/);
 
     await pi.emit("session_start", {}, ui.ctx);
     assert.deepEqual(ui.statuses.at(-1), { key: "pi-api-key-rotator", text: "keys: disabled" });

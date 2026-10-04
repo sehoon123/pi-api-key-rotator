@@ -10,6 +10,7 @@ import { STATUS_KEY } from "./extension.ts";
 import { createInitialPoolState, KeyPool } from "./key-pool.ts";
 import { registerMultiPoolKeyRotatorExtension } from "./multi-pool-extension.ts";
 import type { PoolRuntime } from "./multi-pool-extension.ts";
+import { AGENT_DIR_ENV } from "./pi-host.ts";
 import { JsonFileStateStore } from "./state-store.ts";
 import type {
   EventStreamFactory,
@@ -27,6 +28,8 @@ export interface StartOptions {
   /** Pi's public assistant-message event-stream factory. */
   createEventStream: EventStreamFactory;
   errorPolicy?: ProviderErrorPolicy | undefined;
+  /** Agent directory resolved by the Pi host. */
+  agentDir?: string;
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
   /** Diagnostic sink. Defaults to console.warn. */
@@ -66,8 +69,12 @@ export function registerDisabledCommand(pi: ExtensionApiLike, message: string, w
  */
 export async function startKeyRotator(pi: ExtensionApiLike, options: StartOptions): Promise<StartResult> {
   const warn = options.warn ?? ((message: string) => console.warn(`${LOG_PREFIX} ${message}`));
+  const env =
+    options.agentDir === undefined
+      ? options.env
+      : { ...(options.env ?? process.env), [AGENT_DIR_ENV]: options.agentDir };
   const pathEnv = {
-    ...(options.env === undefined ? {} : { env: options.env }),
+    ...(env === undefined ? {} : { env }),
     ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
   };
 
@@ -82,7 +89,7 @@ export async function startKeyRotator(pi: ExtensionApiLike, options: StartOption
   } catch (error) {
     const message =
       error instanceof ConfigNotFoundError
-        ? `Configuration is missing at ${error.configFile}. Copy an example config there, add at least one pool with two API keys, and run /reload.`
+        ? `Configuration is missing at ${error.configFile}. Copy an example config there and add at least one pool with two API keys. To use another location, set PI_CODING_AGENT_DIR or PI_KEY_ROTATOR_CONFIG before starting Pi, then run /reload.`
         : `Extension is disabled because configuration loading failed: ${error instanceof Error ? error.message : String(error)}`;
     registerDisabledCommand(pi, message, warn);
     return "disabled";
