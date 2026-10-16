@@ -6,6 +6,10 @@ All notable release-facing changes are documented here.
 
 ### Fixed
 
+- Google Generative AI and Vertex adapters no longer receive an injected `fetch`, which both Pi
+  0.84.2 and 1.3.0 reject before making a request. Explicit caller custom transports are refused
+  before any pool attempt instead of being silently discarded. JSON-only Google errors use the
+  bounded `error.code` field for HTTP classification, so a 429 can fail over to another key.
 - **A request no longer fails while a usable key sits parked as `disabled`.** A `401/402/403` used to
   disable a credential until `/key-rotator reset` or a secret change, even if the key was re-issued,
   unblocked or topped up later. When the only enabled key was then exhausted (for example `429

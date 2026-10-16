@@ -90,6 +90,11 @@ Pi adapters do not report failures uniformly:
 - some OpenAI-compatible failures surface only as terminal error text;
 - Anthropic can report an error inside an HTTP-200 event stream;
 - Google and WebSocket paths can omit `onResponse`;
+- Google Generative AI and Vertex reject custom `fetch` in both 0.84.2 and 1.3.0. The wrapper
+  does not inject its observation fetch for those APIs; explicit caller custom fetch is refused
+  before selection, not silently ignored. JSON-only Google failures are classified only by a
+  numeric or digit-string `error.code` in a bounded SDK error envelope. Retry-After is unavailable
+  when the SDK omits headers, so the configured fallback delay applies;
 - diagnostic type names are Pi-specific and can change between releases.
 
 The wrapper may use structured response/diagnostic data and narrowly anchored api-specific fallbacks.

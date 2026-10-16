@@ -574,6 +574,25 @@ function anthropicInBandStatus(event: AssistantEventLike): number | undefined {
   }
 }
 
+function isGoogleSdkApi(api: string): boolean {
+  return api === "google-generative-ai" || api === "google-vertex";
+}
+
+function googleJsonStatus(message: string): number | undefined {
+  // @google/genai preserves JSON as errorMessage but Pi may omit its HTTP
+  // status and onResponse. Accept only the SDK's explicit error.code envelope,
+  // never a number or a quota word found inside free-form message text.
+  if (message.length > 16_384 || !message.trimStart().startsWith("{")) return undefined;
+  try {
+    const body: unknown = JSON.parse(message);
+    if (!isRecord(body) || !isRecord(body.error)) return undefined;
+    const status = diagnosticStatus(body.error.code);
+    return status !== undefined && status >= 400 ? status : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function piAdapterStatusFallback(model: ModelLike, event: AssistantEventLike): number | undefined {
   if (!isErrorTerminal(event) || !isRecord(event.error) || typeof event.error.errorMessage !== "string") {
     return undefined;
@@ -581,6 +600,11 @@ function piAdapterStatusFallback(model: ModelLike, event: AssistantEventLike): n
   if (model.api === "anthropic-messages") {
     const inBand = anthropicInBandStatus(event);
     if (inBand !== undefined) return inBand;
+  }
+
+  if (isGoogleSdkApi(model.api)) {
+    const status = googleJsonStatus(event.error.errorMessage);
+    if (status !== undefined) return status;
   }
 
   const message = event.error.errorMessage.slice(0, 256);
@@ -858,7 +882,10 @@ async function runAttempt(
     ...(rotatedHeaders ? { headers: rotatedHeaders } : {}),
     apiKey: selectedKey.value,
     maxRetries: 0,
-    fetch: observedFetch,
+    // Google SDK adapters reject injected fetch (including on Pi 0.84.2).
+    // Preserve caller/global fetch, use their JSON terminal for error status,
+    // and never monkey-patch the process-wide transport.
+    ...(!isGoogleSdkApi(model.api) ? { fetch: observedFetch } : {}),
     ...(originalOnPayload
       ? {
           onPayload: async (payload: unknown, receivedModel: ModelLike) => {
@@ -1069,6 +1096,15 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
           : `Provider "${model.provider}" is configured for API "${expectedApi}", not "${model.api}".`,
         "error",
         errorConfig,
+      );
+      return output;
+    }
+
+    if (isGoogleSdkApi(model.api) && options?.fetch && options.fetch !== globalThis.fetch) {
+      emitSyntheticError(
+        output, model,
+        "The Google adapter does not support custom fetch. No credential was tried; use a supported transport configuration.",
+        "error", errorConfig,
       );
       return output;
     }
