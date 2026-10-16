@@ -4,6 +4,15 @@ All notable release-facing changes are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `budgetCooldownMs` (default 3,600,000 ms; range 0-86,400,000; 0 disables the extra minimum).
+  Explicit HTTP 429 `budget_exceeded` / `insufficient_quota` errors now use this longer minimum
+  instead of retrying an exhausted budget every minute. Classification uses bounded SDK error JSON
+  or supported structured diagnostics, not keyword guesses. The existing durable cooldown and
+  `rateLimitScope` are preserved; under key scope even free models on that key wait. Other eligible
+  keys can fail over immediately. No raw error body or new state-schema field is persisted.
+
 ### Fixed
 
 - Google Generative AI and Vertex adapters no longer receive an injected `fetch`, which both Pi

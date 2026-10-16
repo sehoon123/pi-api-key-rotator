@@ -53,6 +53,8 @@ export interface RawRotatorConfig {
   requestsPerKey?: number;
   maxAttemptsPerRequest?: number;
   cooldownMs?: number;
+  /** Minimum cooldown for explicit 429 budget_exceeded / insufficient_quota; 0 disables the minimum. */
+  budgetCooldownMs?: number;
   transientCooldownMs?: number;
   maxRetryAfterMs?: number;
   retryStatuses?: number[];
@@ -98,6 +100,8 @@ export interface RotatorConfig {
   requestsPerKey: number;
   maxAttemptsPerRequest: number;
   cooldownMs: number;
+  /** Omitted programmatic configs use one hour; 0 keeps ordinary 429 policy. */
+  budgetCooldownMs?: number;
   transientCooldownMs: number;
   maxRetryAfterMs: number;
   retryStatuses: ReadonlySet<number>;
@@ -219,6 +223,8 @@ export interface PoolSnapshot {
 export interface ProviderResponseLike {
   status: number;
   headers: Record<string, string>;
+  /** Internal classification from a bounded provider error. Never a raw body. */
+  budgetExhausted?: boolean;
 }
 
 export interface ModelLike {

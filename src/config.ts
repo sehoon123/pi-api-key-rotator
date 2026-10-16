@@ -1,4 +1,5 @@
 import { isUtf8 } from "node:buffer";
+import { DEFAULT_BUDGET_COOLDOWN_MS } from "./budget-policy.ts";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -66,6 +67,7 @@ export const POOL_FIELDS = [
   "requestsPerKey",
   "maxAttemptsPerRequest",
   "cooldownMs",
+  "budgetCooldownMs",
   "transientCooldownMs",
   "maxRetryAfterMs",
   "retryStatuses",
@@ -1067,6 +1069,9 @@ export function resolveConfig(
     configFile,
   );
   const cooldownMs = integerInRange(raw.cooldownMs, 60_000, "cooldownMs", 0, 86_400_000, configFile);
+  const budgetCooldownMs = integerInRange(
+    raw.budgetCooldownMs, DEFAULT_BUDGET_COOLDOWN_MS, "budgetCooldownMs", 0, 86_400_000, configFile,
+  );
   const transientCooldownMs = integerInRange(
     raw.transientCooldownMs,
     5_000,
@@ -1145,6 +1150,7 @@ export function resolveConfig(
     requestsPerKey,
     maxAttemptsPerRequest,
     cooldownMs,
+    budgetCooldownMs,
     transientCooldownMs,
     maxRetryAfterMs,
     retryStatuses,

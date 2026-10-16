@@ -23,8 +23,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
   `min(keys.length, 3)`입니다.
 - 지원 adapter가 status를 제공하면 기본적으로 `401/402/403`에서 credential을 비활성화합니다.
 - 비활성화된 credential은 마지막 수단으로 다시 확인합니다. 요청을 처리할 정상 credential이 하나도 없을 때만,
-  credential당 `cooldownMs`에 최대 한 번 시도하며 성공하면 다시 활성화됩니다. 따라서 요청은 설정된 모든
-  credential을 시도했거나 재확인 간격을 기다리는 중일 때만 실패합니다.
+  credential당 `cooldownMs`에 최대 한 번 시도하며 성공하면 다시 활성화됩니다. 요청 시도 한도, target/pool
+  circuit, 재시도 불가 오류, 취소, semantic output 이후 재시도 금지는 계속 적용됩니다.
 - 분류된 `429` cooldown 범위를 `key`, `target`, `pool` 중에서 선택할 수 있습니다.
 - retryable transient HTTP/network failure를 target health failure로 처리합니다.
   `targetFailureThreshold`만큼 연속 실패하면 target circuit을 엽니다.
@@ -174,6 +174,7 @@ runtime validation이 최종 기준입니다.
 | `requestsPerKey` | `20` | 1-1,000,000. shared pool의 모든 선택된 rotator 시도를 합산. |
 | `maxAttemptsPerRequest` | `min(keys.length, 3)` | 1-`keys.length`. 논리적 요청 하나에서 검토할 서로 다른 key 수. |
 | `cooldownMs` | `60000` | 0-86,400,000 ms. `Retry-After`가 없거나 잘못된 경우의 fallback. |
+| `budgetCooldownMs` | `3600000` | 0-86,400,000 ms. 명시적인 429 예산/할당량 소진의 최소 대기시간. `0`이면 일반 429 정책만 적용. |
 | `transientCooldownMs` | `5000` | 0-3,600,000 ms. transient/network target circuit 지속 시간. |
 | `maxRetryAfterMs` | `900000` | 0-86,400,000 ms. `0`은 config cap 없음. safe-integer 제한은 유지. |
 | `retryStatuses` | `401,402,403,408,409,425,429,500,502,503,504` | 비어 있지 않아야 하며 각 status는 100-599. |
@@ -232,6 +233,15 @@ shared pool은 여러 `targets`를 가집니다. key, selection counter, disable
 | `key` | 선택한 credential을 `Retry-After` 또는 `cooldownMs` 동안 cooldown. | 그 credential은 모든 shared target에서 중단되고 다른 key는 계속 가능. |
 | `target` | 해당 provider target circuit을 즉시 그 시간 동안 open. | shared pool의 다른 target은 계속 가능. |
 | `pool` | pool 전체를 즉시 그 시간 동안 cooldown. | 그 pool의 어떤 target/key도 계속할 수 없음. |
+
+HTTP `429`의 JSON `type` 또는 `code`가 정확히 `budget_exceeded`/`insufficient_quota`이면 일반 대기시간과
+`budgetCooldownMs`(기본 1시간) 중 큰 값을 사용합니다. 크기가 제한된 SDK 오류 JSON 또는 지원하는 구조화 진단만
+판별하며 임의의 문장에 예산이라는 단어가 있다고 적용하지 않습니다. `maxRetryAfterMs`는 서버의 Retry-After를
+제한하지만 로컬 최소 대기시간을 줄이지 않습니다. 기존 durable cooldown과 `rateLimitScope`를 사용합니다.
+따라서 기본 `key` 범위에서는 **무료 모델을 포함한 모든 모델·공유 target에서 해당 키가 잠시 제외**됩니다.
+다른 사용 가능한 키로는 즉시 전환하며, 서로 다른 키가 할당량을 공유한다고 가정하지 않습니다.
+`budgetCooldownMs: 0`으로 비활성화할 수 있고, 충전이 확인되면 `/key-rotator reset`으로 대기시간을 해제할 수
+있습니다(카운터와 disabled 상태도 함께 초기화).
 
 다른 retryable transient status 또는 network failure에서는 선택한 key의 failure counter를 올리지만 key를
 cooldown/disable하지 않습니다. target의 consecutive failure가 증가하고 `targetFailureThreshold`에
@@ -426,6 +436,9 @@ mv "$state.recovered.tmp" "$state"
 
 다음 한계는 Pi 0.84.2, pi-ai, vendor SDK에 있습니다.
 
+- Google Generative AI/Vertex에는 custom fetch를 주입하지 않고 SDK의 기본 전송과 JSON `error.code`를
+  사용합니다. 호출자가 별도의 fetch를 전달하면 무시하지 않고 키 선택 전에 거부합니다. Google이 Retry-After를
+  제공하지 않으면 설정된 fallback을 사용합니다.
 - adapter failure reporting이 균일하지 않습니다. 일부 OpenAI-compatible non-2xx, Anthropic HTTP-200
   in-band error, Google/WebSocket path는 `onResponse`, status, `Retry-After`를 누락할 수 있습니다. 분류할 수
   없는 failure에는 status별 disable/cooldown을 적용할 수 없습니다.

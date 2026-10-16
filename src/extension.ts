@@ -138,7 +138,7 @@ export function formatStatus(
 
   for (const key of snapshot.keys) {
     let state = key.available ? "ready" : "unavailable";
-    if (key.disabled) state = "disabled (use /key-rotator reset after fixing the key)";
+    if (key.disabled) state = "disabled (eligible for a last-resort re-check after the interval/cooldown)";
     else if (key.cooldownUntil > now) state = `cooldown ${duration(key.cooldownUntil - now)}`;
     const marker = key.current ? "*" : " ";
     lines.push(

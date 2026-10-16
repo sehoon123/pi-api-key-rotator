@@ -1,4 +1,5 @@
 import type { KeyPool } from "./key-pool.ts";
+import { isBudgetExhaustedError } from "./budget-policy.ts";
 import type {
   AssistantEventLike,
   AssistantEventStreamLike,
@@ -511,7 +512,7 @@ function statusForFailureKind(kind: string): number | undefined {
   }
   if (["auth", "authentication", "authentication_error", "authorization"].includes(kind)) return 401;
   if (["permission", "permission_error", "forbidden"].includes(kind)) return 403;
-  if (["rate_limit", "rate_limit_error"].includes(kind)) return 429;
+  if (["rate_limit", "rate_limit_error", "budget_exceeded", "insufficient_quota"].includes(kind)) return 429;
   if (["overloaded", "overloaded_error", "server_error"].includes(kind)) return 503;
   return undefined;
 }
@@ -550,7 +551,10 @@ function classifyTerminalDiagnostic(
     httpDecision = {
       kind: "http",
       decision: config.retryStatuses.has(status) ? "retry" : "forward",
-      response: { status, headers: diagnosticHeaders(diagnostic.details) },
+      response: {
+        status, headers: diagnosticHeaders(diagnostic.details),
+        ...(["budget_exceeded", "insufficient_quota"].includes(kind) ? { budgetExhausted: true } : {}),
+      },
     };
   }
   return httpDecision;
@@ -775,7 +779,9 @@ function describeUnavailable(snapshot: PoolSnapshot, targetId: string, recheckAf
     const nextRecheck = Math.min(
       ...snapshot.keys
         .filter((key) => key.disabled)
-        .map((key) => Math.max(key.cooldownUntil, (key.lastAttemptAt ?? 0) + recheckAfterMs)),
+        .map((key) => Math.min(8_640_000_000_000_000, Math.max(
+          key.cooldownUntil, Math.max(key.lastAttemptAt ?? 0, key.lastFailureAt ?? 0) + recheckAfterMs,
+        ))),
     );
     details.push(
       `disabled: ${disabled.join(", ")}` +
@@ -1148,6 +1154,9 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
         notifyStateChange(deps, selection.snapshot);
 
         const result = await runAttempt(deps, output, model, context, options, errorConfig, selected);
+        if (result.response?.status === 429 && isBudgetExhaustedError(errorText(result.error))) {
+          result.response = { ...result.response, budgetExhausted: true };
+        }
         lastVisiblePartial = result.partialMessage;
         if (result.terminalEvent?.type === "error" && isRecord(result.terminalEvent.error)) {
           lastVisiblePartial = result.terminalEvent.error as unknown as AssistantMessageLike;
@@ -1247,7 +1256,9 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
               selected.attemptNumber,
               selected.credentialFingerprint,
             );
-          lastFailure = "the provider returned a retryable response";
+          lastFailure = result.response.budgetExhausted
+            ? "the provider reported exhausted budget"
+            : "the provider returned a retryable response";
           lastDiagnostic = result.error ? safeErrorText(result.error, errorConfig) : undefined;
         } else {
           snapshot = await deps.pool.recordNetworkFailure(

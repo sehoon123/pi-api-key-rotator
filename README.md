@@ -22,8 +22,8 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
   `min(keys.length, 3)`.
 - Disables a credential on `401/402/403` by default when a supported adapter exposes that status.
 - Re-checks a disabled credential as a last resort: only when no healthy credential can serve the
-  request, at most once per `cooldownMs` per credential. A success re-enables it, so a request fails only
-  after every configured credential has been tried or is waiting out its interval.
+  request, at most once per `cooldownMs` per credential. A success re-enables it. Request budgets,
+  target/pool circuits, non-retryable errors, cancellation, and the semantic-output boundary still apply.
 - Applies a classified `429` cooldown at `key`, `target`, or `pool` scope.
 - Treats retryable transient HTTP and network failures as target health failures. A target circuit
   opens after `targetFailureThreshold` consecutive failures.
@@ -175,6 +175,7 @@ root. Top-level `pools` cannot be combined with pool fields.
 | `requestsPerKey` | `20` | 1-1,000,000 selected rotator attempts, summed across a shared pool |
 | `maxAttemptsPerRequest` | `min(keys.length, 3)` | 1-`keys.length`; distinct keys considered for one wrapper invocation |
 | `cooldownMs` | `60000` | 0-86,400,000 ms; fallback when `Retry-After` is missing or invalid |
+| `budgetCooldownMs` | `3600000` | 0-86,400,000 ms; minimum delay for explicit 429 budget/quota exhaustion; `0` keeps ordinary 429 policy |
 | `transientCooldownMs` | `5000` | 0-3,600,000 ms; target-circuit duration for transient/network failure |
 | `maxRetryAfterMs` | `900000` | 0-86,400,000 ms; `0` removes the configured cap, subject to safe-integer limits |
 | `retryStatuses` | `401,402,403,408,409,425,429,500,502,503,504` | non-empty; every status is 100-599 |
@@ -237,6 +238,16 @@ the same `api` type, but a provider id can belong to only one pool. See
 | `key` | cool the selected credential for parsed `Retry-After` or `cooldownMs` | that credential stops on every shared target; other keys can continue |
 | `target` | open that provider target circuit immediately for the delay | other targets in the shared pool can continue |
 | `pool` | cool the entire pool immediately for the delay | no target or key in that pool can continue |
+
+Explicit HTTP `429` errors with JSON `type` or `code` equal to `budget_exceeded` or `insufficient_quota`
+use the larger of the ordinary delay and `budgetCooldownMs` (one hour by default). Only bounded SDK
+error JSON or a supported structured diagnostic is inspected; arbitrary prose does not trigger this
+policy. `maxRetryAfterMs` still caps the provider's Retry-After, but does not shorten this local minimum.
+The longer delay uses the existing durable cooldown and the configured `rateLimitScope`: under the
+usual `key` scope it temporarily excludes that credential on **all models and shared targets**,
+including any free models that might still work. Other eligible keys are tried immediately; quota is
+not assumed to be shared across keys. Use `budgetCooldownMs: 0` to opt out, or `/key-rotator reset`
+after confirmed replenishment to clear local cooldowns (also clears counters and disabled states).
 
 For another classified retryable transient status, or a network failure, the selected key's failure
 counter is updated but the key is not cooled or disabled. The target's consecutive-failure count
@@ -426,6 +437,10 @@ on age.
 
 These boundaries are in Pi 0.84.2, pi-ai, or vendor SDKs:
 
+- Google Generative AI and Vertex reject injected custom fetch; the wrapper leaves their native
+  transport alone and classifies JSON-only SDK `error.code` failures. A caller-supplied custom fetch
+  is rejected before selecting a key, rather than silently bypassing it. Google may still omit
+  Retry-After, in which case the configured fallback is used.
 - Adapter failure reporting is not uniform. Some OpenAI-compatible non-2xx responses, Anthropic
   HTTP-200 in-band errors, Google paths, and WebSocket paths can omit `onResponse`, status, or
   `Retry-After`. An unclassified failure cannot receive status-specific disable/cooldown behavior.

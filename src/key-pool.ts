@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { DEFAULT_BUDGET_COOLDOWN_MS } from "./budget-policy.ts";
 import { StateCorruptionError } from "./state-store.ts";
 import type { StateStore } from "./state-store.ts";
 import type {
@@ -650,12 +651,17 @@ export class KeyPool {
           keyState.cooldownUntil = 0;
         }
       } else if (this.config.cooldownStatuses.has(response.status)) {
-        const delayMs = parseRetryAfterMs(
+        const ordinaryDelay = parseRetryAfterMs(
           response.headers,
           now,
           this.config.cooldownMs,
           this.config.maxRetryAfterMs,
         );
+        // maxRetryAfterMs caps the provider's Retry-After, not this local quota
+        // policy. Preserve scope and ordering; do not permanently disable the key.
+        const budgetMinimum = response.status === 429 && response.budgetExhausted
+          ? this.config.budgetCooldownMs ?? DEFAULT_BUDGET_COOLDOWN_MS : 0;
+        const delayMs = Math.min(Math.max(ordinaryDelay, budgetMinimum), Math.max(0, MAX_DATE_MS - now));
         if ((this.config.rateLimitScope ?? "key") === "key") {
           if (currentKeyOutcome) {
             keyState.cooldownUntil = Math.max(keyState.cooldownUntil, now + delayMs);
@@ -877,7 +883,9 @@ export class KeyPool {
         continue;
       }
       const lastAttemptAt = keyState.lastAttemptAt ?? 0;
-      if (now - lastAttemptAt < this.config.cooldownMs) continue;
+      // A slow rejection may arrive long after selection. Start its waiting
+      // interval at the verdict too, rather than immediately re-checking it.
+      if (now - Math.max(lastAttemptAt, keyState.lastFailureAt ?? 0) < this.config.cooldownMs) continue;
       if (candidate === null || lastAttemptAt < candidate.lastAttemptAt) {
         candidate = { id: key.id, lastAttemptAt };
       }
