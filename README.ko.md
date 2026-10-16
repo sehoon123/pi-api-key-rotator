@@ -22,6 +22,9 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - 하나의 wrapper 요청에서 최대 `maxAttemptsPerRequest`개의 서로 다른 key를 시도합니다. 기본값은
   `min(keys.length, 3)`입니다.
 - 지원 adapter가 status를 제공하면 기본적으로 `401/402/403`에서 credential을 비활성화합니다.
+- 비활성화된 credential은 마지막 수단으로 다시 확인합니다. 요청을 처리할 정상 credential이 하나도 없을 때만,
+  credential당 `cooldownMs`에 최대 한 번 시도하며 성공하면 다시 활성화됩니다. 따라서 요청은 설정된 모든
+  credential을 시도했거나 재확인 간격을 기다리는 중일 때만 실패합니다.
 - 분류된 `429` cooldown 범위를 `key`, `target`, `pool` 중에서 선택할 수 있습니다.
 - retryable transient HTTP/network failure를 target health failure로 처리합니다.
   `targetFailureThreshold`만큼 연속 실패하면 target circuit을 엽니다.
@@ -236,6 +239,14 @@ cooldown/disable하지 않습니다. target의 consecutive failure가 증가하�
 더 오래된 pool cooldown을 해제합니다. attempt ordering fence 때문에 더 오래된 late failure가 그 key를
 다시 disable하거나 해제된 scope를 다시 열 수 없습니다.
 
+비활성화는 과거의 판정이지 영구적인 사실이 아닙니다. pool이 실행되는 동안에도 key가 재발급·차단 해제·충전됩니다.
+요청에 쓸 정상 credential이 하나도 없으면 pool은 마지막 시도가 가장 오래된 비활성 credential을 다시 확인하며,
+이 시도도 다른 attempt처럼 `maxAttemptsPerRequest`에 포함됩니다. credential당 `cooldownMs`에 최대 한 번만
+재확인하고(시도는 selection transaction 안에서 기록되므로 동시 요청이 폐기된 key를 반복해서 두드리지 않음),
+해당 credential 자신의 `429` cooldown 중에는 재확인하지 않습니다. 성공하면 다시 활성화되고, 다시 거부되면
+비활성 상태로 남아 간격이 새로 시작됩니다. 정상 credential이 있으면 항상 그쪽이 우선합니다.
+`N`개 key를 가진 pool에서 한 요청이 모든 key에 닿게 하려면 `maxAttemptsPerRequest`를 `N`으로 설정하세요.
+
 기본 threshold `2`에서는 `maxAttemptsPerRequest`가 `3`이어도 두 번의 연속 target failure 뒤 세 번째 key를
 쓰지 않고 중단할 수 있습니다. target/pool scope `429`는 즉시 해당 scope를 닫으므로 같은 요청에서 다른
 key도 그 unavailable scope를 계속 사용할 수 없습니다.
@@ -248,7 +259,7 @@ key도 그 unavailable scope를 계속 사용할 수 없습니다.
 | Semantic output 전 outcome | Durable 처리 | 동일 wrapper failover |
 |---|---|---|
 | 정상 `2xx`/`3xx` terminal | success | 아니오 |
-| `disableStatuses` | 선택한 credential 비활성화 | 다른 key와 scope가 available이면 예 |
+| `disableStatuses` | 선택한 credential 비활성화 (이후 재확인, 아래 참고) | 다른 key와 scope가 available이면 예 |
 | `cooldownStatuses` | `rateLimitScope` delay 적용 | 선택 scope가 계속 available인 경우만 |
 | 그 외 `retryStatuses` | target circuit 업데이트 | circuit/attempt budget이 멈출 때까지 예 |
 | `400` 같은 non-retry status | failure 기록 후 최종 error 전달 | 아니오 |
@@ -441,7 +452,7 @@ upstream log를 보호하고 credential을 다룰 때 provider debug logging을 
 | managed request가 dispatch 전에 거부됨 | selected model API mismatch, pool preflight 실패, 또는 Pi가 정확한 rotator registration을 유지하지 않음. 원인을 수정하고 `/reload` 실행. |
 | managed provider가 rotation 없이 fallback 전송 | 즉시 중단. trusted component가 검증된 Pi 0.84.2 extension pipeline을 bypass했거나 cancellation을 무시함. |
 | `The credential rotator stopped this request. Review diagnostics for details.` | 알림 또는 `/key-rotator errors`에서 실제 원인 확인. budget, credential, state의 실제 실패는 계속 안전하게 중단. |
-| `No rotation entry is currently available (...)` | key, target, pool scope 중 하나가 unavailable. status 확인. |
+| `No rotation entry is currently available (...)` | key, target, pool scope 중 하나가 unavailable. status 확인. `disabled: ...; next re-check <시각>`은 비활성 credential을 다시 시도할 수 있는 시각입니다. |
 | `Credential failover exhausted N attempt(s)` | wrapper budget 소진 또는 target/pool circuit 중단. Pi outer retry는 별도일 수 있음. |
 | state corruption/security/size error | fail closed 상태. reset이 아니라 복구 절차 사용. |
 | state lock timeout | live/ambiguous writer 또는 contention. process 확인 전 sidecar 삭제 금지. |

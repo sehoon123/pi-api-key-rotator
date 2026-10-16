@@ -21,6 +21,9 @@ footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
 - Tries at most `maxAttemptsPerRequest` distinct keys for one logical wrapper request. The default is
   `min(keys.length, 3)`.
 - Disables a credential on `401/402/403` by default when a supported adapter exposes that status.
+- Re-checks a disabled credential as a last resort: only when no healthy credential can serve the
+  request, at most once per `cooldownMs` per credential. A success re-enables it, so a request fails only
+  after every configured credential has been tried or is waiting out its interval.
 - Applies a classified `429` cooldown at `key`, `target`, or `pool` scope.
 - Treats retryable transient HTTP and network failures as target health failures. A target circuit
   opens after `targetFailureThreshold` consecutive failures.
@@ -241,6 +244,15 @@ increases. At `targetFailureThreshold`, its circuit opens for `transientCooldown
 clears health for its key and target and clears an older pool cooldown. Attempt ordering prevents an
 older late failure from re-disabling that key or reopening the cleared scope.
 
+A disabled credential is a verdict from the past, not a permanent fact: keys get re-issued, unblocked
+or topped up while a pool keeps running. When selection finds no healthy credential for a request, the
+pool re-checks the disabled credential whose last attempt is oldest, counted against
+`maxAttemptsPerRequest` like any other attempt. A credential is re-checked at most once per `cooldownMs`
+(the attempt itself is recorded in the selection transaction, so concurrent requests cannot stampede a
+revoked key), and never while its own `429` cooldown is running. Success re-enables it; another
+rejection keeps it disabled and restarts the interval. Healthy credentials are never displaced.
+To let a request reach every key of an `N`-key pool, set `maxAttemptsPerRequest` to `N`.
+
 With the default threshold `2`, two consecutive target failures can stop a wrapper invocation before
 a third key is consumed. A target- or pool-scoped rate limit opens its scope immediately, so another
 key cannot continue against that unavailable scope in the same invocation.
@@ -253,7 +265,7 @@ failure. See [Known upstream limits](#12-known-upstream-limits) for adapters tha
 | Outcome before semantic output | Durable action | Same-wrapper failover |
 |---|---|---|
 | normal `2xx`/`3xx` terminal | success | no |
-| `disableStatuses` | disable selected credential | yes, if another key and scope are available |
+| `disableStatuses` | disable selected credential (re-checked later, see below) | yes, if another key and scope are available |
 | `cooldownStatuses` | apply `rateLimitScope` delay | only if the selected scope remains available |
 | other `retryStatuses` | update target circuit | yes, until circuit/attempt budget stops it |
 | non-retry status such as `400` | record failure and forward final error | no |
@@ -440,7 +452,7 @@ zero and review the separate agent-level retry setting.
 | managed request is refused before dispatch | the selected model API differs, pool preflight failed, or Pi did not retain the exact rotator registration; fix the cause, then run `/reload` |
 | managed provider sends an unrotated fallback | stop immediately; a trusted component bypassed or ignored the verified Pi 0.84.2 extension pipeline |
 | `The credential rotator stopped this request. Review diagnostics for details.` | inspect the cause shown in the notification or run `/key-rotator errors`; genuine budget, credential, or state failures still stop safely |
-| `No rotation entry is currently available (...)` | key, target, or pool scope is unavailable; inspect status |
+| `No rotation entry is currently available (...)` | key, target, or pool scope is unavailable; inspect status. `disabled: ...; next re-check <time>` names when a disabled credential may be tried again |
 | `Credential failover exhausted N attempt(s)` | wrapper budget ended or a target/pool circuit stopped selection; Pi may still have an outer retry |
 | state corruption/security/size error | state failed closed; use recovery, not reset |
 | state lock timeout | a live or ambiguous writer owns the lock, or contention exceeded `lockTimeoutMs`; confirm processes before cleanup |

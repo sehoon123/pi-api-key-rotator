@@ -88,6 +88,93 @@ test("401 disables a key for future selections", async () => {
   assert.equal(snapshot.totalAttempts, 0);
 });
 
+test("a long-disabled key is re-checked as a last resort and recovers on success", async () => {
+  const time = mutableClock(1_000);
+  const config = makeConfig({ cooldownMs: 60_000 });
+  const store = new InMemoryStateStore(createInitialPoolState(config, time.clock.now()));
+  const pool = new KeyPool(config, store, time.clock);
+
+  // key-1 and key-2 were rejected with 403 earlier, so only key-3 stays enabled.
+  for (const id of ["key-1", "key-2"]) {
+    const selected = await pool.select();
+    assert.equal(selected?.id, id);
+    await pool.recordFailure(id, { status: 403, headers: {} }, selected?.epoch);
+  }
+  time.advance(7 * 24 * 60 * 60 * 1_000);
+
+  // While a healthy key exists it is always preferred: no re-check happens.
+  assert.equal((await pool.select())?.id, "key-3");
+
+  // Once key-3 has been tried and is excluded, the oldest disabled key is re-checked
+  // instead of reporting that nothing is available.
+  const recheck = await pool.select(new Set(["key-3"]));
+  assert.equal(recheck?.id, "key-1");
+  let snapshot = await pool.snapshot();
+  assert.equal(snapshot.keys.find((key) => key.id === "key-1")?.disabled, true, "still disabled until it succeeds");
+  assert.equal(snapshot.keys.find((key) => key.id === "key-1")?.lastAttemptAt, time.clock.now());
+
+  assert.ok(recheck);
+  await pool.recordSuccess("key-1", 200, recheck.epoch, undefined, recheck.attemptNumber, recheck.credentialFingerprint);
+  snapshot = await pool.snapshot();
+  const recovered = snapshot.keys.find((key) => key.id === "key-1");
+  assert.equal(recovered?.disabled, false);
+  assert.equal(recovered?.available, true);
+  assert.equal(snapshot.keys.find((key) => key.id === "key-2")?.disabled, true, "untried keys stay parked");
+});
+
+test("a re-checked key that is rejected again is left alone for cooldownMs", async () => {
+  const time = mutableClock(1_000);
+  const base = makeConfig();
+  const config = makeConfig({ keys: base.keys.slice(0, 2), cooldownMs: 60_000 });
+  const store = new InMemoryStateStore(createInitialPoolState(config, time.clock.now()));
+  const pool = new KeyPool(config, store, time.clock);
+
+  const first = await pool.select();
+  await pool.recordFailure("key-1", { status: 403, headers: {} }, first?.epoch);
+  const second = await pool.select();
+  assert.equal(second?.id, "key-2");
+  await pool.recordFailure("key-2", { status: 403, headers: {} }, second?.epoch);
+
+  // Both keys were attempted just now, so nothing is retried inside the interval.
+  assert.equal(await pool.select(), null);
+  time.advance(59_999);
+  assert.equal(await pool.select(), null);
+
+  // After the interval the oldest attempt (key-1) is re-checked first and fails again.
+  time.advance(1);
+  const recheck = await pool.select();
+  assert.equal(recheck?.id, "key-1");
+  assert.ok(recheck);
+  await pool.recordFailure("key-1", { status: 403, headers: {} }, recheck.epoch, undefined, recheck.attemptNumber, recheck.credentialFingerprint);
+
+  // key-1 now waits a full interval again while key-2 is the next-oldest candidate.
+  const next = await pool.select();
+  assert.equal(next?.id, "key-2");
+  assert.equal(await pool.select(), null, "no stampede on dead keys");
+});
+
+test("a disabled key still serving a 429 cooldown is not re-checked early", async () => {
+  const time = mutableClock(1_000);
+  const base = makeConfig();
+  const config = makeConfig({ keys: base.keys.slice(0, 2), cooldownMs: 60_000 });
+  const store = new InMemoryStateStore(createInitialPoolState(config, time.clock.now()));
+  const pool = new KeyPool(config, store, time.clock);
+
+  const first = await pool.select();
+  await pool.recordFailure("key-1", { status: 403, headers: {} }, first?.epoch);
+  time.advance(10 * 60_000);
+
+  // A re-check that meets a rate limit records the cooldown; the key stays out until it ends.
+  const recheck = await pool.select(new Set(["key-2"]));
+  assert.equal(recheck?.id, "key-1");
+  assert.ok(recheck);
+  await pool.recordFailure("key-1", { status: 429, headers: { "Retry-After": "300" } }, recheck.epoch, undefined, recheck.attemptNumber, recheck.credentialFingerprint);
+  time.advance(120_000);
+  assert.equal(await pool.select(new Set(["key-2"])), null);
+  time.advance(180_001);
+  assert.equal((await pool.select(new Set(["key-2"])))?.id, "key-1");
+});
+
 test("concurrent selections are serialized without losing counters", async () => {
   const time = mutableClock(30_000);
   const config = makeConfig({ requestsPerKey: 3 });

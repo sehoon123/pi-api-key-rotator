@@ -515,7 +515,11 @@ export class KeyPool {
       ) {
         return { selected: null, snapshot: this.snapshotFromState(state, now) };
       }
-      const selectedId = this.findAvailable(state, state.currentKeyId, excludedKeyIds, true, now);
+      // Healthy credentials always win. Only when none can serve this request does the pool
+      // fall back to re-verifying a credential that an earlier 401/402/403 disabled.
+      const selectedId =
+        this.findAvailable(state, state.currentKeyId, excludedKeyIds, true, now) ??
+        this.findRecheckCandidate(state, excludedKeyIds, now);
       let selectedDefinition: RotatorConfig["keys"][number] | undefined;
       let attemptNumber = state.totalAttempts;
 
@@ -832,6 +836,53 @@ export class KeyPool {
         !keyState.disabled &&
         keyState.cooldownUntil <= now,
     );
+  }
+
+  /**
+   * Last resort when no healthy credential can serve the request: pick a credential
+   * that an earlier 401/402/403 disabled so that it can prove it works again.
+   *
+   * `disabled` records a verdict from the past, not a permanent fact. Keys are
+   * re-issued, unblocked or topped up while a pool keeps running, and a pool that
+   * never looks again fails requests with "no key available" while perfectly good
+   * keys sit parked. This is deliberately narrow:
+   *
+   * - it is reached only after `findAvailable` found nothing, so healthy keys are
+   *   never displaced and a pool with enough working keys never pays for it;
+   * - a credential is re-checked at most once per `cooldownMs`. The attempt itself
+   *   stamps `lastAttemptAt` inside the selection transaction, so concurrent
+   *   requests cannot stampede a key that is really revoked;
+   * - the oldest attempt goes first, so one dead key cannot starve the others;
+   * - a credential still serving a 429 cooldown, or whose configured secret changed
+   *   under a newer config revision, is skipped like any other unavailable key.
+   *
+   * Success clears `disabled` through `recordSuccess`; another rejection leaves it
+   * disabled and restarts the interval.
+   */
+  private findRecheckCandidate(
+    state: PoolState,
+    excluded: ReadonlySet<string>,
+    now: number,
+  ): string | null {
+    let candidate: { id: string; lastAttemptAt: number } | null = null;
+    for (const key of this.config.keys) {
+      if (excluded.has(key.id)) continue;
+      const keyState = state.keys[key.id];
+      if (
+        !keyState ||
+        !keyState.disabled ||
+        keyState.cooldownUntil > now ||
+        keyState.credentialFingerprint !== configuredFingerprint(this.config, key.id, key.value)
+      ) {
+        continue;
+      }
+      const lastAttemptAt = keyState.lastAttemptAt ?? 0;
+      if (now - lastAttemptAt < this.config.cooldownMs) continue;
+      if (candidate === null || lastAttemptAt < candidate.lastAttemptAt) {
+        candidate = { id: key.id, lastAttemptAt };
+      }
+    }
+    return candidate?.id ?? null;
   }
 
   private findAvailable(

@@ -2,6 +2,22 @@
 
 All notable release-facing changes are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **A request no longer fails while a usable key sits parked as `disabled`.** A `401/402/403` used to
+  disable a credential until `/key-rotator reset` or a secret change, even if the key was re-issued,
+  unblocked or topped up later. When the only enabled key was then exhausted (for example `429
+  budget_exceeded`), the wrapper reported `Credential failover exhausted 1 attempt(s)` or `No rotation
+  entry is currently available` without ever trying the disabled keys, although they worked.
+  When no healthy credential can serve the request, the pool now re-checks the disabled credential whose
+  last attempt is oldest, at most once per `cooldownMs` per credential, counted against
+  `maxAttemptsPerRequest`. Success re-enables the key. Healthy keys are still always preferred, a key in its
+  own `429` cooldown is skipped, and no state-schema or config change is required.
+- `No rotation entry is currently available (...)` now names when a disabled credential may be
+  re-checked (`disabled: ...; next re-check <time>`).
+
 ## [0.4.0] - 2026-08-24
 
 ### Compatibility and packaging

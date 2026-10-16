@@ -733,7 +733,7 @@ function notifyStateChange(deps: RotatingStreamDependencies, snapshot: PoolSnaps
   }
 }
 
-function describeUnavailable(snapshot: PoolSnapshot, targetId: string): string {
+function describeUnavailable(snapshot: PoolSnapshot, targetId: string, recheckAfterMs: number): string {
   const now = Date.now();
   if (snapshot.poolCooldownUntil > now) {
     return `pool cooldown until ${new Date(snapshot.poolCooldownUntil).toISOString()}`;
@@ -746,7 +746,18 @@ function describeUnavailable(snapshot: PoolSnapshot, targetId: string): string {
   const cooling = snapshot.keys.filter((key) => !key.disabled && key.cooldownUntil > now);
   const details: string[] = [];
 
-  if (disabled.length > 0) details.push(`disabled: ${disabled.join(", ")}`);
+  if (disabled.length > 0) {
+    // A disabled key is re-checked as a last resort once its interval and any 429 cooldown pass.
+    const nextRecheck = Math.min(
+      ...snapshot.keys
+        .filter((key) => key.disabled)
+        .map((key) => Math.max(key.cooldownUntil, (key.lastAttemptAt ?? 0) + recheckAfterMs)),
+    );
+    details.push(
+      `disabled: ${disabled.join(", ")}` +
+        (nextRecheck > now ? `; next re-check ${new Date(nextRecheck).toISOString()}` : ""),
+    );
+  }
   if (cooling.length > 0) {
     const earliest = Math.min(...cooling.map((key) => key.cooldownUntil));
     details.push(`cooldown until ${new Date(earliest).toISOString()}: ${cooling.map((key) => key.id).join(", ")}`);
@@ -1087,7 +1098,7 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
         }
         if (!selected) {
           if (excludedKeyIds.size > 0) break;
-          const unavailable = describeUnavailable(selection.snapshot, model.provider);
+          const unavailable = describeUnavailable(selection.snapshot, model.provider, deps.config.cooldownMs);
           emitSyntheticError(
             output,
             model,

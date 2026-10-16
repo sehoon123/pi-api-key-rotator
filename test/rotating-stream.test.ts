@@ -224,6 +224,94 @@ test("401 disables the failed key for future selections and retries with the nex
   assert.equal(snapshot.currentKeyId, "key-2");
 });
 
+test("an exhausted enabled key falls through to long-disabled keys instead of failing the request", async () => {
+  const time = mutableClock(1_000);
+  const config = makeConfig({ maxAttemptsPerRequest: 3 });
+  const { pool } = setup(config, time);
+
+  // key-1 and key-2 were rejected with 403 a week ago; key-3 is the only enabled key.
+  for (const id of ["key-1", "key-2"]) {
+    const selected = await pool.select();
+    assert.equal(selected?.id, id);
+    await pool.recordFailure(id, { status: 403, headers: {} }, selected?.epoch);
+  }
+  time.advance(7 * 24 * 60 * 60 * 1_000);
+
+  const observed: Array<{ apiKey: string | undefined; maxRetries: number | undefined }> = [];
+  const rotating = createRotatingStream({
+    config,
+    pool,
+    baseStreamSimple: scriptedHttpStream([{ status: 429 }, { status: 200 }], observed),
+    createEventStream: () => new TestEventStream(),
+  });
+
+  const events = await collect(rotating(model, { messages: [] }));
+  assert.equal(events.at(-1)?.type, "done");
+  assert.deepEqual(observed.map((entry) => entry.apiKey), ["secret-three", "secret-one"]);
+
+  const snapshot = await pool.snapshot();
+  assert.equal(snapshot.keys.find((key) => key.id === "key-1")?.disabled, false, "recovered by the re-check");
+  assert.equal(snapshot.keys.find((key) => key.id === "key-2")?.disabled, true, "not needed, so not touched");
+  assert.equal(snapshot.keys.find((key) => key.id === "key-3")?.available, false, "429 cooldown applies");
+  assert.equal(snapshot.currentKeyId, "key-1");
+});
+
+test("the request errors only after every key, including disabled ones, has been tried", async () => {
+  // describeUnavailable() formats against the wall clock, so anchor the fake clock there.
+  const time = mutableClock(Date.now());
+  const config = makeConfig({ maxAttemptsPerRequest: 3 });
+  const { pool } = setup(config, time);
+  for (const id of ["key-1", "key-2"]) {
+    const selected = await pool.select();
+    await pool.recordFailure(id, { status: 403, headers: {} }, selected?.epoch);
+  }
+  time.advance(60 * 60 * 1_000);
+
+  const observed: Array<{ apiKey: string | undefined; maxRetries: number | undefined }> = [];
+  const rotating = createRotatingStream({
+    config,
+    pool,
+    baseStreamSimple: scriptedHttpStream([{ status: 429 }, { status: 403 }, { status: 403 }], observed),
+    createEventStream: () => new TestEventStream(),
+  });
+
+  const events = await collect(rotating(model, { messages: [] }));
+  const last = events.at(-1);
+  assert.equal(last?.type, "error");
+  assert.deepEqual(observed.map((entry) => entry.apiKey), ["secret-three", "secret-one", "secret-two"]);
+  assert.match(JSON.stringify((last as { error: unknown }).error), /exhausted 3 attempt/i);
+
+  // The dead keys are not hammered by the next request inside the interval.
+  const again = await collect(rotating(model, { messages: [] }));
+  assert.equal(again.at(-1)?.type, "error");
+  assert.equal(observed.length, 3, "no provider call is made while every key is cooling or just re-checked");
+  const message = JSON.stringify((again.at(-1) as { error: unknown }).error);
+  assert.match(message, /No rotation entry is currently available/);
+  assert.match(message, /disabled: key-1, key-2; next re-check \d{4}-\d{2}-\d{2}T/, "says when the dead keys may be tried again");
+  assert.match(message, /cooldown until [^:]*T[^:]*:[^:]*:[^:]*: key-3/);
+});
+
+test("healthy keys are always preferred over disabled ones", async () => {
+  const time = mutableClock(1_000);
+  const config = makeConfig({ maxAttemptsPerRequest: 3, requestsPerKey: 2 });
+  const { pool } = setup(config, time);
+  const selected = await pool.select();
+  await pool.recordFailure("key-1", { status: 403, headers: {} }, selected?.epoch);
+  time.advance(24 * 60 * 60 * 1_000);
+
+  const observed: Array<{ apiKey: string | undefined; maxRetries: number | undefined }> = [];
+  const rotating = createRotatingStream({
+    config,
+    pool,
+    baseStreamSimple: scriptedHttpStream(Array.from({ length: 6 }, () => ({ status: 200 })), observed),
+    createEventStream: () => new TestEventStream(),
+  });
+  for (let index = 0; index < 6; index += 1) {
+    assert.equal((await collect(rotating(model, { messages: [] }))).at(-1)?.type, "done");
+  }
+  assert.ok(!observed.some((entry) => entry.apiKey === "secret-one"), "key-1 is never used while others work");
+});
+
 test("a non-retriable 400 response is forwarded without trying another key", async () => {
   const config = makeConfig();
   const { pool } = setup(config);
