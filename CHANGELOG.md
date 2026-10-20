@@ -4,6 +4,18 @@ All notable release-facing changes are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- The status-bar footer now uses the shared glyph language (● healthy, ◐ cooldown,
+  ✗ disabled/fault) with semantic colors, and modern compact text: `key-1 3/50`,
+  `key-1 · cooldown 45s`, `key-1 · disabled`; multi-pool footers read
+  `pool · key n/m`. The footer is hidden entirely for the ordinary
+  not-my-job states (no model selected, unmanaged provider) instead of
+  advertising `rotation inactive: ...`; actionable config faults render red
+  (`api mismatch · selected X ≠ configured Y`, `pool <id> · disabled (state
+  preflight)`, `✗ rotation disabled` in disabled mode). Full detail stays in
+  `/key-rotator status` and doctor output, which remain the verbose homes.
+
 ### Added
 
 - `budgetCooldownMs` (default 3,600,000 ms; range 0-86,400,000; 0 disables the extra minimum).

@@ -12,7 +12,7 @@ bounded and redacted. Upstream adapters, SDK logs, and Pi's separate agent-level
 that boundary; see [Known upstream limits](#12-known-upstream-limits).
 
 ```text
-footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
+footer:  pi-api-key-rotator   ● ibm-ica-shared · ica-key-3 7/20
 ```
 
 ## 1. What v0.4.0 does
@@ -462,7 +462,7 @@ zero and review the separate agent-level retry setting.
 
 | Symptom | Cause and fix |
 |---|---|
-| footer says `keys: disabled` | local config or startup failed; run `/key-rotator` for the captured load error |
+| footer says `✗ rotation disabled` | local config or startup failed; run `/key-rotator` for the captured load error |
 | duplicate extension/provider registration | the request fence and doctor fail after the competing registration is observed; remove duplicate copies and run `/reload` |
 | managed request is refused before dispatch | the selected model API differs, pool preflight failed, or Pi did not retain the exact rotator registration; fix the cause, then run `/reload` |
 | managed provider sends an unrotated fallback | stop immediately; a trusted component bypassed or ignored the verified Pi 0.84.2 extension pipeline |

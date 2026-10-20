@@ -6,7 +6,7 @@
 import { loadConfigSet } from "./config-set.ts";
 import { ConfigNotFoundError } from "./config.ts";
 import { buildDoctorReport } from "./doctor.ts";
-import { STATUS_KEY } from "./extension.ts";
+import { renderFooterText, STATUS_KEY } from "./extension.ts";
 import { createInitialPoolState, KeyPool } from "./key-pool.ts";
 import { registerMultiPoolKeyRotatorExtension } from "./multi-pool-extension.ts";
 import type { PoolRuntime } from "./multi-pool-extension.ts";
@@ -49,7 +49,7 @@ export function registerDisabledCommand(pi: ExtensionApiLike, message: string, w
   });
   pi.on("session_start", (_event, ctx) => {
     try {
-      ctx.ui.setStatus(STATUS_KEY, "keys: disabled");
+      ctx.ui.setStatus(STATUS_KEY, renderFooterText(ctx.ui, "error", "rotation disabled"));
     } catch {
       // Disabled mode must remain usable when footer rendering fails.
     }

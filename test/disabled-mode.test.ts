@@ -88,7 +88,7 @@ test("a missing configuration uses Pi's host-resolved agent directory", async ()
     assert.match(message, /run \/reload/);
 
     await pi.emit("session_start", {}, ui.ctx);
-    assert.deepEqual(ui.statuses.at(-1), { key: "pi-api-key-rotator", text: "keys: disabled" });
+    assert.deepEqual(ui.statuses.at(-1), { key: "pi-api-key-rotator", text: "✗ rotation disabled" });
     await pi.emit("session_shutdown", {}, ui.ctx);
     assert.deepEqual(ui.statuses.at(-1), { key: "pi-api-key-rotator", text: undefined });
     assert.equal(warnings.length, 1);
@@ -266,7 +266,7 @@ test("startup contains one corrupt pool while registering healthy pools", async 
       id: "secondary-model",
     };
     await pi.emit("session_start", {}, ui.ctx);
-    assert.match(ui.statuses.at(-1)?.text ?? "", /rotation inactive.*secondary.*disabled/i);
+    assert.match(ui.statuses.at(-1)?.text ?? "", /pool secondary · disabled \(state preflight\)/i);
     await pi.commands.get("key-rotator")!.handler("status secondary", ui.ctx);
     assert.match(ui.notifications.at(-1)?.message ?? "", /evidence is preserved/i);
     assert.equal(await readFile(secondaryState, "utf8"), corruptEvidence);

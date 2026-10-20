@@ -1,5 +1,9 @@
 import {
   compactStatus,
+  compactTone,
+  inactiveFooterView,
+  renderFooterText,
+  type FooterTone,
   fallbackApiKey,
   formatStatus,
   MANAGED_KEY_PLACEHOLDER,
@@ -177,7 +181,7 @@ function isEnabled(runtime: PreparedPool): runtime is EnabledPool {
 }
 
 function concisePoolStatus(id: string, snapshot: PoolSnapshot): string {
-  return `${id}: ${compactStatus(snapshot).replace(/^keys:\s*/, "")}`;
+  return `${id} · ${compactStatus(snapshot)}`;
 }
 
 function disabledPoolStatus(runtime: DisabledPool): string {
@@ -193,21 +197,9 @@ function conciseDisabledPoolStatus(runtime: DisabledPool): string {
   return `${runtime.id}: disabled (state preflight failed; evidence preserved)`;
 }
 
-function inactiveFooter(reason: InactiveReason): string {
-  switch (reason.kind) {
-    case "no-model":
-      return "rotation inactive: no model selected";
-    case "unmanaged":
-      return `rotation inactive: provider "${reason.provider}" is unmanaged`;
-    case "api-mismatch":
-      return (
-        `rotation inactive: API mismatch for provider "${reason.provider}" ` +
-        `(selected "${reason.selectedApi}", configured "${reason.configuredApi}")`
-      );
-    case "pool-disabled":
-      return `rotation inactive: pool "${reason.poolId}" is disabled after state preflight failure`;
-  }
-}
+// The footer view mirrors the single-pool extension: silent for the ordinary
+// not-my-job states, red for actionable config faults.
+
 
 function inactiveCommandReason(reason: InactiveReason): string {
   switch (reason.kind) {
@@ -322,10 +314,18 @@ export async function registerMultiPoolKeyRotatorExtension(
     return captureOwner() as OwnerToken;
   };
 
-  const commitFooter = (token: OwnerToken, sequence: number, text: string): void => {
+  const commitFooter = (
+    token: OwnerToken,
+    sequence: number,
+    view: { tone: FooterTone; text: string } | undefined,
+  ): void => {
     if (!stillOwns(token) || sequence !== footerSequence) return;
     try {
-      token.owner.ui.setStatus(STATUS_KEY, text);
+      if (!view) {
+        token.owner.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+      token.owner.ui.setStatus(STATUS_KEY, renderFooterText(token.owner.ui, view.tone, view.text));
     } catch {
       // Footer rendering must never fail a session, command, or request.
     }
@@ -340,7 +340,7 @@ export async function registerMultiPoolKeyRotatorExtension(
     const sequence = reservedSequence ?? ++footerSequence;
     const selected = selection;
     if (selected.kind === "inactive") {
-      commitFooter(token, sequence, inactiveFooter(selected.reason));
+      commitFooter(token, sequence, inactiveFooterView(selected.reason));
       return;
     }
 
@@ -352,10 +352,13 @@ export async function registerMultiPoolKeyRotatorExtension(
       // The await above can cross a session, UI, or model change. Both owner
       // generations and the monotonic footer sequence fence the result.
       if (!stillOwns(token)) return;
-      commitFooter(token, sequence, concisePoolStatus(selected.runtime.id, snapshot));
+      commitFooter(token, sequence, {
+        tone: compactTone(snapshot),
+        text: concisePoolStatus(selected.runtime.id, snapshot),
+      });
     } catch {
       if (!stillOwns(token)) return;
-      commitFooter(token, sequence, `${selected.runtime.id}: state unavailable`);
+      commitFooter(token, sequence, { tone: "error", text: `${selected.runtime.id} · state unavailable` });
     }
   };
 

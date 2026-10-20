@@ -99,12 +99,38 @@ function configuredPoolId(config: Pick<RotatorConfig, "provider" | "poolId">): s
   return config.poolId ?? config.provider;
 }
 
+/** Footer tone for one pool snapshot, mirroring the shared glyph language:
+ * success ●, warning ◐ (cooldown), error ✗ (disabled or unreadable). */
+export type FooterTone = "success" | "warning" | "error";
+
+export function footerGlyph(tone: FooterTone): string {
+  return tone === "success" ? "●" : tone === "warning" ? "◐" : "✗";
+}
+
+/** Render footer text with the tone glyph and semantic color; the theme is
+ * optional so non-TUI hosts fall back to the plain glyph + text. */
+export function renderFooterText(ui: unknown, tone: FooterTone, text: string): string {
+  let rendered = `${footerGlyph(tone)} ${text}`;
+  const fg = (ui as { theme?: { fg?: (tone: string, text: string) => string } } | undefined)?.theme?.fg;
+  if (typeof fg === "function") {
+    try { rendered = fg(tone, rendered); } catch { /* non-TUI fallback */ }
+  }
+  return rendered;
+}
+
 export function compactStatus(snapshot: PoolSnapshot, now = Date.now()): string {
   const current = snapshot.keys.find((key) => key.id === snapshot.currentKeyId);
-  if (!current) return "keys: unavailable";
-  if (current.disabled) return `keys: ${current.id} disabled`;
-  if (current.cooldownUntil > now) return `keys: ${current.id} cooldown ${duration(current.cooldownUntil - now)}`;
-  return `keys: ${current.id} ${snapshot.requestsOnCurrent}/${snapshot.requestsPerKey}`;
+  if (!current) return "state unavailable";
+  if (current.disabled) return `${current.id} · disabled`;
+  if (current.cooldownUntil > now) return `${current.id} · cooldown ${duration(current.cooldownUntil - now)}`;
+  return `${current.id} ${snapshot.requestsOnCurrent}/${snapshot.requestsPerKey}`;
+}
+
+export function compactTone(snapshot: PoolSnapshot, now = Date.now()): FooterTone {
+  const current = snapshot.keys.find((key) => key.id === snapshot.currentKeyId);
+  if (!current || current.disabled) return "error";
+  if (current.cooldownUntil > now) return "warning";
+  return "success";
 }
 
 export function formatStatus(
@@ -159,19 +185,22 @@ function sanitizedStateFailure(error: unknown): string {
   return "state validation failed";
 }
 
-function inactiveFooter(reason: InactiveReason): string {
+/** The footer view for an inactive selection. `undefined` hides the segment —
+ * an unmanaged provider or no model is the ordinary not-my-job state, and a
+ * modern footer stays silent instead of advertising it. Actionable config
+ * faults render red. */
+export function inactiveFooterView(reason: InactiveReason): { tone: FooterTone; text: string } | undefined {
   switch (reason.kind) {
     case "no-model":
-      return "rotation inactive: no model selected";
     case "unmanaged":
-      return `rotation inactive: provider "${reason.provider}" is unmanaged`;
+      return undefined;
     case "api-mismatch":
-      return (
-        `rotation inactive: API mismatch for provider "${reason.provider}" ` +
-        `(selected "${reason.selectedApi}", configured "${reason.configuredApi}")`
-      );
+      return {
+        tone: "error",
+        text: `api mismatch · selected ${reason.selectedApi} ≠ configured ${reason.configuredApi}`,
+      };
     case "pool-disabled":
-      return `rotation inactive: pool "${reason.poolId}" is disabled after state preflight failure`;
+      return { tone: "error", text: `pool ${reason.poolId} · disabled (state preflight)` };
   }
 }
 
@@ -268,10 +297,18 @@ export async function registerKeyRotatorExtension(
     return captureOwner() as OwnerToken;
   };
 
-  const commitFooter = (token: OwnerToken, sequence: number, text: string): void => {
+  const commitFooter = (
+    token: OwnerToken,
+    sequence: number,
+    view: { tone: FooterTone; text: string } | undefined,
+  ): void => {
     if (!stillOwns(token) || sequence !== footerSequence) return;
     try {
-      token.owner.ui.setStatus(STATUS_KEY, text);
+      if (!view) {
+        token.owner.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+      token.owner.ui.setStatus(STATUS_KEY, renderFooterText(token.owner.ui, view.tone, view.text));
     } catch {
       // Footer rendering must never fail a session, command, or request.
     }
@@ -286,17 +323,17 @@ export async function registerKeyRotatorExtension(
     const sequence = reservedSequence ?? ++footerSequence;
     const selected = selection;
     if (selected.kind === "inactive") {
-      commitFooter(token, sequence, inactiveFooter(selected.reason));
+      commitFooter(token, sequence, inactiveFooterView(selected.reason));
       return;
     }
 
     try {
       const resolved = snapshot ?? (await pool.snapshot());
       if (!stillOwns(token)) return;
-      commitFooter(token, sequence, compactStatus(resolved));
+      commitFooter(token, sequence, { tone: compactTone(resolved), text: compactStatus(resolved) });
     } catch {
       if (!stillOwns(token)) return;
-      commitFooter(token, sequence, "keys: state unavailable");
+      commitFooter(token, sequence, { tone: "error", text: "state unavailable" });
     }
   };
 

@@ -224,7 +224,7 @@ test("status formatting includes operational data but not environment values", (
     ],
   };
 
-  assert.equal(compactStatus(snapshot, 100), "keys: primary 4/20");
+  assert.equal(compactStatus(snapshot, 100), "primary 4/20");
   const detailed = formatStatus(snapshot, "company-ai", 100);
   assert.match(detailed, /attempts=24/);
   assert.match(detailed, /circuit open 5s/);

@@ -208,7 +208,7 @@ class TrackingStateStore {
 
 function uiRecorder(modelValue?: ModelLike) {
   const notifications: Array<{ message: string; type: string | undefined }> = [];
-  const statuses: string[] = [];
+  const statuses: Array<string | undefined> = [];
   const ctx: ExtensionContextLike = {
     ...(modelValue ? { model: modelValue } : {}),
     ui: {
@@ -216,7 +216,7 @@ function uiRecorder(modelValue?: ModelLike) {
         notifications.push({ message, type });
       },
       setStatus(_key, text) {
-        if (text !== undefined) statuses.push(text);
+        statuses.push(text);
       },
     },
   };
@@ -392,20 +392,20 @@ test("a command reuses its atomic snapshot for the footer", async () => {
     createEventStream: () => new TestEventStream(),
   });
   const preflightReads = snapshotReads;
-  const statuses: string[] = [];
+  const statuses: Array<string | undefined> = [];
   const ctx: ExtensionContextLike = {
     model: model("provider-primary"),
     ui: {
       notify() {},
       setStatus(_key, text) {
-        if (text) statuses.push(text);
+        statuses.push(text);
       },
     },
   };
 
   await pi.commands.get("key-rotator")!.handler("status primary", ctx);
   assert.equal(snapshotReads - preflightReads, 1);
-  assert.match(statuses.at(-1) ?? "", /^primary:/);
+  assert.match(statuses.at(-1) ?? "", /^● primary ·/);
 });
 
 test("doctor FAIL uses an error notification and never refreshes a broken footer", async () => {
@@ -468,7 +468,7 @@ test("state preflight disables only the invalid pool and never mutates its evide
 
   const ui = uiRecorder(model("provider-secondary"));
   await pi.emit("session_start", {}, ui.ctx);
-  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*pool "secondary".*disabled/i);
+  assert.match(ui.statuses.at(-1) ?? "", /pool secondary · disabled \(state preflight\)/i);
   await pi.commands.get("key-rotator")!.handler("status secondary", ui.ctx);
   assert.match(ui.notifications.at(-1)?.message ?? "", /evidence is preserved/i);
   assert.equal(secondaryStore.transactions, 0);
@@ -495,7 +495,7 @@ test("unmanaged and API-mismatched models clear active selection and fence bare 
 
   const unmanaged = { provider: "ordinary-provider", api: "openai-completions", id: "ordinary" };
   await pi.emit("model_select", { model: unmanaged }, ui.ctx);
-  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  assert.equal(ui.statuses.at(-1), undefined, "an unmanaged selection hides the footer");
   const primaryBeforeRefusedReset = await primaryPool.snapshot();
   await command.handler("reset", ui.ctx);
   const primaryAfterRefusedReset = await primaryPool.snapshot();
@@ -505,8 +505,7 @@ test("unmanaged and API-mismatched models clear active selection and fence bare 
 
   const mismatch = { provider: "provider-secondary", api: "anthropic-messages", id: "wrong-api" };
   await pi.emit("model_select", { model: mismatch }, ui.ctx);
-  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*API mismatch/i);
-  assert.match(ui.statuses.at(-1) ?? "", /selected "anthropic-messages".*configured "openai-completions"/i);
+  assert.match(ui.statuses.at(-1) ?? "", /api mismatch · selected anthropic-messages ≠ configured openai-completions/i);
   await command.handler("next", ui.ctx);
   assert.equal((await secondaryPool.snapshot()).currentKeyId, "key-1");
   assert.match(ui.notifications.at(-1)?.message ?? "", /bare destructive command was refused/i);
@@ -514,7 +513,7 @@ test("unmanaged and API-mismatched models clear active selection and fence bare 
   // An explicit selector remains an intentional administrative action.
   await command.handler("next secondary", ui.ctx);
   assert.equal((await secondaryPool.snapshot()).currentKeyId, "key-2");
-  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*API mismatch/i);
+  assert.match(ui.statuses.at(-1) ?? "", /api mismatch/i);
 });
 
 test("a deferred session snapshot cannot paint a newer UI owner", async () => {
@@ -545,12 +544,12 @@ test("a deferred session snapshot cannot paint a newer UI owner", async () => {
     id: "ordinary",
   });
   await pi.emit("session_start", {}, newUi.ctx);
-  assert.match(newUi.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  assert.equal(newUi.statuses.at(-1), undefined, "an unmanaged selection hides the footer");
   pending.resolve(staleSnapshot);
   await oldStart;
 
   assert.deepEqual(oldUi.statuses, []);
-  assert.match(newUi.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  assert.equal(newUi.statuses.at(-1), undefined, "the footer stays hidden for the unmanaged selection");
   primaryPool.snapshot = originalSnapshot;
 });
 
@@ -587,7 +586,7 @@ test("deferred command results are silent after model selection changes", async 
   await commandResult;
 
   assert.equal(ui.notifications.length, noticesBefore);
-  assert.match(ui.statuses.at(-1) ?? "", /rotation inactive.*unmanaged/i);
+  assert.equal(ui.statuses.at(-1), undefined, "the footer stays hidden for the unmanaged selection");
   primaryPool.snapshot = originalSnapshot;
 });
 
@@ -609,10 +608,10 @@ test("a queued request footer stays newer than an earlier deferred snapshot", as
   await Promise.resolve();
   await collect(pi.providers.get("provider-primary")!.streamSimple(model("provider-primary"), {}));
   await Promise.resolve();
-  assert.match(ui.statuses.at(-1) ?? "", /^primary: key-1 1\/2$/);
+  assert.match(ui.statuses.at(-1) ?? "", /^● primary · key-1 1\/2$/);
 
   pending.resolve(staleSnapshot);
   await startup;
-  assert.match(ui.statuses.at(-1) ?? "", /^primary: key-1 1\/2$/);
+  assert.match(ui.statuses.at(-1) ?? "", /^● primary · key-1 1\/2$/);
   primaryPool.snapshot = originalSnapshot;
 });

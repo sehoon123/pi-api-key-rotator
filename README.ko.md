@@ -13,7 +13,7 @@ raw secret은 저장하지 않습니다. state v2에는 SHA-256 credential ident
 [알려진 upstream 한계](#12-known-upstream-한계)를 참고하세요.
 
 ```text
-footer:  pi-api-key-rotator   ibm-ica-shared: ica-key-3 7/20
+footer:  pi-api-key-rotator   ● ibm-ica-shared · ica-key-3 7/20
 ```
 
 ## 1. v0.4.0 주요 기능
