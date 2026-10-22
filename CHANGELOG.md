@@ -27,6 +27,12 @@ All notable release-facing changes are documented here.
 
 ### Fixed
 
+- A same-request failover after a transport failure with no provider response now waits before the next
+  credential attempt (1 s, 3 s, 6 s, then 10 s for later attempts) instead of retrying instantly.
+  Networks that briefly refuse new TCP connections used to spend the whole attempt budget inside the
+  same refusal window, ending in `Credential failover exhausted ... Connection error` or
+  `The credential rotator stopped this request`. The delay is abort-aware, so cancellation still
+  returns immediately and no state-schema or config change is required.
 - Google Generative AI and Vertex adapters no longer receive an injected `fetch`, which both Pi
   0.84.2 and 1.3.0 reject before making a request. Explicit caller custom transports are refused
   before any pool attempt instead of being silently discarded. JSON-only Google errors use the

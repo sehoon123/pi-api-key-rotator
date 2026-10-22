@@ -49,6 +49,35 @@ type DiagnosticDecision =
   | { kind: "network" };
 
 const MAX_FORWARDED_ERROR_TEXT = 2_000;
+/**
+ * Backoff before a same-request failover after a transport failure with no
+ * provider response. Some networks briefly refuse new TCP connections after a
+ * burst; retrying instantly lands in the same refusal window and burns the
+ * whole attempt budget in milliseconds. Waiting lets the path recover.
+ */
+const NETWORK_RETRY_DELAYS_MS = [1_000, 3_000, 6_000, 10_000] as const;
+
+function sleepBeforeNetworkRetry(attempt: number, signal?: AbortSignal): Promise<void> {
+  const index = Math.min(attempt - 1, NETWORK_RETRY_DELAYS_MS.length - 1);
+  const delayMs = NETWORK_RETRY_DELAYS_MS[index] ?? 0;
+  if (!(delayMs > 0)) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
+
 const FINAL_ERROR_MESSAGE = "The credential rotator stopped this request. Review diagnostics for details.";
 const FINAL_DIAGNOSTIC_TYPE = "pi_key_rotator_final";
 const PACKAGE_NAME = "pi-api-key-rotator";
@@ -1272,6 +1301,9 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
           lastDiagnostic = result.error ? safeErrorText(result.error, errorConfig) : undefined;
         }
         notifyStateChange(deps, snapshot);
+        if (result.outcome === "retry-network" && attempt < deps.config.maxAttemptsPerRequest) {
+          await sleepBeforeNetworkRetry(attempt, options?.signal);
+        }
       }
 
       emitSyntheticError(
