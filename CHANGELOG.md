@@ -18,6 +18,16 @@ All notable release-facing changes are documented here.
 
 ### Added
 
+- `retryTransientAtAgentLevel` (default `false`) lets safe pre-output transient failures enter Pi's
+  configured bounded outer retry instead of turning every exhausted wrapper error into a terminal
+  stop. Auth/permission failures, explicit budget exhaustion, the host's quota/billing veto,
+  cancellation, local state errors, and visible output remain terminal.
+- `maxCooldownWaitMs` (default `0`; range 0-900,000 ms) provides a cumulative, abortable cooldown
+  wait budget per wrapper invocation. It requires the outer-retry opt-in and waits only before the
+  first credential selection, without a provider request, state reset, or state lock held asleep.
+- Targeted Pi 1.4.0 loopback integration tests cover transient recovery, cooldown waiting, bounded
+  retry exhaustion, cancellation, partial-output safety, and API fencing; a test-only peer resolver
+  supports using an installed host without vendoring Pi core. See `docs/UNATTENDED_RECOVERY.md`.
 - `budgetCooldownMs` (default 3,600,000 ms; range 0-86,400,000; 0 disables the extra minimum).
   Explicit HTTP 429 `budget_exceeded` / `insufficient_quota` errors now use this longer minimum
   instead of retrying an exhausted budget every minute. Classification uses bounded SDK error JSON
@@ -27,6 +37,13 @@ All notable release-facing changes are documented here.
 
 ### Fixed
 
+- Anthropic HTTP-200 in-band `api_error` / `internal_server_error` envelopes are classified as HTTP
+  500 rather than tentative success or an unknown network failure. A real non-2xx HTTP response
+  remains authoritative.
+- A transient HTTP `Retry-After`, including on 503, opens the target circuit immediately instead of
+  trying another credential before the backend's requested delay. The existing parsing cap applies.
+- Recoverable final failures are reported as warnings while their sanitized cause remains available
+  through `/key-rotator errors`.
 - A same-request failover after a transport failure with no provider response now waits before the next
   credential attempt (1 s, 3 s, 6 s, then 10 s for later attempts) instead of retrying instantly.
   Networks that briefly refuse new TCP connections used to spend the whole attempt budget inside the

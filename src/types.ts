@@ -65,6 +65,10 @@ export interface RawRotatorConfig {
   /** Consecutive transient/network failures before a target circuit opens. */
   targetFailureThreshold?: number;
   retryNetworkErrors?: boolean;
+  /** Opt in to Pi's bounded outer retry, but only for transient failures before semantic output. */
+  retryTransientAtAgentLevel?: boolean;
+  /** Cumulative cooldown waiting per wrapper invocation (0 disables waiting, at most 15 minutes). */
+  maxCooldownWaitMs?: number;
   stateFile?: string;
   lockTimeoutMs?: number;
   staleLockMs?: number;
@@ -112,6 +116,8 @@ export interface RotatorConfig {
   /** Resolved configs set this; omitted programmatic configs use 2. */
   targetFailureThreshold?: number;
   retryNetworkErrors: boolean;
+  retryTransientAtAgentLevel?: boolean;
+  maxCooldownWaitMs?: number;
   stateFile: string;
   lockTimeoutMs: number;
   staleLockMs: number;

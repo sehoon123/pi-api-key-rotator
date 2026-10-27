@@ -136,12 +136,20 @@ follow network failover without overriding a reliable HTTP failure or replaying 
 
 Recognized input overflow before output, with no conflicting auth/transient status, receives the
 canonical `context_length_exceeded` marker. Pi may compact and retry the changed input through its
-bounded recovery policy. Other finalized errors remain retry-neutral. Minimal sanitized failure
+bounded recovery policy. Other finalized errors remain retry-neutral by default. The explicit
+`retryTransientAtAgentLevel` opt-in instead hands pre-output transient failures to Pi's bounded outer
+retry, with a fixed marker rather than raw provider text. Auth, exhausted budgets, the host's quota
+veto, cancellation, state failures, and visible output remain terminal. `maxCooldownWaitMs` can make
+a fresh wrapper await cooldowns without a provider request or a state lock held asleep; its budget
+is cumulative per invocation and already-tried keys are never recycled. Minimal sanitized failure
 metadata is stored in non-context custom entries and exposed through `/key-rotator errors`.
 
 `test/current-host-recovery.integration.mjs` additionally exercises these paths through an installed
-Pi 0.99.1 loader and real loopback HTTP adapters. This is a targeted recovery check, not a substitute
-for the full host-upgrade checklist below.
+Pi 0.99.1 loader and real loopback HTTP adapters. `test/local-reliability.integration.mjs` separately
+checks the opt-in unattended recovery paths with an installed Pi 1.4.0 host; it verifies actual
+outer retries, cooldown waiting, bounded exhaustion, and cancellation through the package entry.
+These are targeted recovery checks, not substitutes for the full host-upgrade checklist below.
+See [Unattended recovery](UNATTENDED_RECOVERY.md) for configuration and safety boundaries.
 
 ## 8. State and cross-process ownership
 

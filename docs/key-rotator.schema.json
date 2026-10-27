@@ -10,6 +10,16 @@
         "configVersion": {
           "const": 1
         },
+        "retryTransientAtAgentLevel": {
+          "type": "boolean",
+          "default": false
+        },
+        "maxCooldownWaitMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 900000,
+          "default": 0
+        },
         "budgetCooldownMs": {
           "type": "integer",
           "minimum": 0,
@@ -186,6 +196,16 @@
     "pool": {
       "type": "object",
       "properties": {
+        "retryTransientAtAgentLevel": {
+          "type": "boolean",
+          "default": false
+        },
+        "maxCooldownWaitMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 900000,
+          "default": 0
+        },
         "budgetCooldownMs": {
           "type": "integer",
           "minimum": 0,

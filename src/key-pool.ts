@@ -672,15 +672,21 @@ export class KeyPool {
           state.poolCooldownUntil = Math.max(state.poolCooldownUntil, now + delayMs);
         }
       } else if (this.config.retryStatuses.has(response.status)) {
-        // 5xx/transient failures are target health, not credential health.
+        // A provider's Retry-After applies to the target, not only this key.
+        // Open the circuit immediately when it asks us to wait, rather than
+        // sending another key into the same unavailable backend.
+        const hasRetryAfter = Object.keys(response.headers).some((name) => name.toLowerCase() === "retry-after");
+        const delayMs = parseRetryAfterMs(
+          response.headers, now, this.config.transientCooldownMs, this.config.maxRetryAfterMs,
+        );
         this.recordTargetFailure(
           state,
           targetId,
           response.status,
           outcomeAttempt,
           now,
-          this.config.transientCooldownMs,
-          false,
+          delayMs,
+          hasRetryAfter,
         );
       }
 

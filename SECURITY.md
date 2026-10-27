@@ -61,6 +61,20 @@ bypass these hooks by calling `ctx.modelRegistry.complete()` or `fetch` directly
 extension, provider, SDK, or Pi build can also mutate registry/request data, ignore `AbortSignal`, or
 bypass hooks entirely. The extension is not a sandbox for that code.
 
+## Opt-in unattended recovery
+
+`retryTransientAtAgentLevel` is off by default. Enabling it allows only pre-output transient
+failures to enter Pi's configured, bounded outer retry loop. Authentication/permission failures,
+explicit exhausted budgets, the host's quota/billing veto, cancellation, local state errors, and
+already-visible output remain terminal. A fixed sanitized marker controls retry; raw provider
+text is not copied into that marker. This is not a new whole-turn or physical-call ceiling.
+
+`maxCooldownWaitMs` is a cumulative wait budget per wrapper invocation, capped at 900,000 ms and
+requiring that opt-in. Waiting makes no provider request, consumes no credential attempt, does not
+hold a state lock, and never resets credentials or quota cooldowns. A transient HTTP Retry-After
+opens the target circuit immediately, subject to the existing parsing cap. Provider access and
+billing controls are unchanged. See [Unattended recovery](docs/UNATTENDED_RECOVERY.md).
+
 ## Config and path hardening
 
 The default `<agent dir>` is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. An explicit

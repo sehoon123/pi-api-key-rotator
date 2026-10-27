@@ -76,6 +76,8 @@ export const POOL_FIELDS = [
   "rateLimitScope",
   "targetFailureThreshold",
   "retryNetworkErrors",
+  "retryTransientAtAgentLevel",
+  "maxCooldownWaitMs",
   "stateFile",
   "lockTimeoutMs",
   "staleLockMs",
@@ -1096,6 +1098,15 @@ export function resolveConfig(
     100,
     configFile,
   );
+  const retryTransientAtAgentLevel = booleanValue(
+    raw.retryTransientAtAgentLevel, false, "retryTransientAtAgentLevel", configFile,
+  );
+  const maxCooldownWaitMs = integerInRange(
+    raw.maxCooldownWaitMs, 0, "maxCooldownWaitMs", 0, 900_000, configFile,
+  );
+  if (maxCooldownWaitMs > 0 && !retryTransientAtAgentLevel) {
+    throw new ConfigValidationError(configFile, '"maxCooldownWaitMs" requires "retryTransientAtAgentLevel": true.');
+  }
   const lockTimeoutMs = integerInRange(raw.lockTimeoutMs, 5_000, "lockTimeoutMs", 100, 60_000, configFile);
   const staleLockMs = integerInRange(raw.staleLockMs, 30_000, "staleLockMs", 1_000, 600_000, configFile);
   const maxStateFileBytes = integerInRange(
@@ -1159,6 +1170,8 @@ export function resolveConfig(
     rateLimitScope: rateLimitScopeValue(raw.rateLimitScope, configFile),
     targetFailureThreshold,
     retryNetworkErrors: booleanValue(raw.retryNetworkErrors, true, "retryNetworkErrors", configFile),
+    retryTransientAtAgentLevel,
+    maxCooldownWaitMs,
     stateFile,
     lockTimeoutMs,
     staleLockMs,

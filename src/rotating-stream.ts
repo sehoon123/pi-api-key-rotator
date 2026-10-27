@@ -21,6 +21,9 @@ export interface RotatingStreamDependencies {
   baseStreamSimple: StreamSimpleLike;
   createEventStream: EventStreamFactory;
   errorPolicy?: ProviderErrorPolicy | undefined;
+  /** Injectable only for deterministic recovery tests; production uses the wall clock and abortable timers. */
+  now?: () => number;
+  sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   onStateChange?: (snapshot: PoolSnapshot) => void | Promise<void>;
 }
 
@@ -57,9 +60,7 @@ const MAX_FORWARDED_ERROR_TEXT = 2_000;
  */
 const NETWORK_RETRY_DELAYS_MS = [1_000, 3_000, 6_000, 10_000] as const;
 
-function sleepBeforeNetworkRetry(attempt: number, signal?: AbortSignal): Promise<void> {
-  const index = Math.min(attempt - 1, NETWORK_RETRY_DELAYS_MS.length - 1);
-  const delayMs = NETWORK_RETRY_DELAYS_MS[index] ?? 0;
+function sleepForRecovery(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (!(delayMs > 0)) return Promise.resolve();
   return new Promise<void>((resolve) => {
     if (signal?.aborted) {
@@ -78,7 +79,13 @@ function sleepBeforeNetworkRetry(attempt: number, signal?: AbortSignal): Promise
   });
 }
 
+function sleepBeforeNetworkRetry(attempt: number, signal?: AbortSignal): Promise<void> {
+  const index = Math.min(attempt - 1, NETWORK_RETRY_DELAYS_MS.length - 1);
+  return sleepForRecovery(NETWORK_RETRY_DELAYS_MS[index] ?? 0, signal);
+}
+
 const FINAL_ERROR_MESSAGE = "The credential rotator stopped this request. Review diagnostics for details.";
+const TRANSIENT_ERROR_MESSAGE = "Temporary provider server error before output. Pi may retry within its configured budget.";
 const FINAL_DIAGNOSTIC_TYPE = "pi_key_rotator_final";
 const PACKAGE_NAME = "pi-api-key-rotator";
 
@@ -120,12 +127,15 @@ function finalizeErrorMessage(
   config?: RotatorConfig,
   detail?: string,
   contextOverflow = false,
+  retryableBeforeOutput = false,
 ): void {
   const redactor = config ? createErrorRedactor(config) : undefined;
   const safe = (value: string): string =>
     redactor ? sanitizeText(value, redactor) : value.slice(0, MAX_FORWARDED_ERROR_TEXT);
   const safeSummary = safe(summary);
   const safeDetail = detail === undefined ? undefined : safe(detail);
+  const mayRetry = retryableBeforeOutput && !contextOverflow && error.stopReason === "error" &&
+    !partialHasSemanticContent(error);
   const existing = Array.isArray(error.diagnostics) ? error.diagnostics : [];
   error.diagnostics = [
     ...existing,
@@ -135,16 +145,16 @@ function finalizeErrorMessage(
       error: { name: "PiKeyRotatorFinalized", message: safeSummary },
       details: {
         source: PACKAGE_NAME,
-        reason: contextOverflow ? "context_overflow" : reason,
+        reason: contextOverflow ? "context_overflow" : mayRetry ? "transient_before_output" : reason,
         ...(safeDetail === undefined ? {} : { detail: safeDetail }),
       },
     },
   ];
-  // Pi classifies recovery from errorMessage, not diagnostics. Preserve a
-  // recognized overflow marker so it can compact the input, but keep finalized
-  // rotation/transport failures neutral to avoid replaying output or bypassing
-  // the wrapper's attempt budget with a second, agent-level retry loop.
-  error.errorMessage = contextOverflow ? "context_length_exceeded" : FINAL_ERROR_MESSAGE;
+  // Pi classifies recovery from errorMessage, not diagnostics. The opt-in
+  // outer retry gets a fixed, sanitized transient marker only before output.
+  // Auth, quota, local-state failures and visible output remain retry-neutral.
+  error.errorMessage = contextOverflow ? "context_length_exceeded" :
+    mayRetry ? TRANSIENT_ERROR_MESSAGE : FINAL_ERROR_MESSAGE;
 }
 
 function emitSyntheticError(
@@ -155,6 +165,7 @@ function emitSyntheticError(
   config?: RotatorConfig,
   diagnosticDetail?: string,
   baseMessage?: AssistantMessageLike,
+  retryableBeforeOutput = false,
 ): void {
   const redactor = config ? createErrorRedactor(config) : undefined;
   const safeMessage = redactor
@@ -171,7 +182,7 @@ function emitSyntheticError(
       : redactor
         ? sanitizeText(diagnosticDetail, redactor)
         : diagnosticDetail.slice(0, MAX_FORWARDED_ERROR_TEXT);
-    finalizeErrorMessage(error, "rotator_terminal_error", safeMessage, config, safeDetail);
+    finalizeErrorMessage(error, "rotator_terminal_error", safeMessage, config, safeDetail, false, retryableBeforeOutput);
   }
   output.push({ type: "error", reason, error });
 }
@@ -542,6 +553,7 @@ function statusForFailureKind(kind: string): number | undefined {
   if (["auth", "authentication", "authentication_error", "authorization"].includes(kind)) return 401;
   if (["permission", "permission_error", "forbidden"].includes(kind)) return 403;
   if (["rate_limit", "rate_limit_error", "budget_exceeded", "insufficient_quota"].includes(kind)) return 429;
+  if (["api_error", "internal_server_error"].includes(kind)) return 500;
   if (["overloaded", "overloaded_error", "server_error"].includes(kind)) return 503;
   return undefined;
 }
@@ -1108,6 +1120,54 @@ async function runAttempt(
   return { outcome: "retry-network", response, error };
 }
 
+function mayRetryTransientAtAgentLevel(
+  deps: RotatingStreamDependencies,
+  result: AttemptResult,
+  model: ModelLike,
+): boolean {
+  if (!deps.config.retryTransientAtAgentLevel || result.started || partialHasSemanticContent(result.partialMessage)) {
+    return false;
+  }
+  const terminal = isRecord(result.error) && result.error.type === "error" ? result.error.error : result.error;
+  if (partialHasSemanticContent(terminal)) return false;
+  const detail = errorText(result.error);
+  if (result.response) {
+    const { status, budgetExhausted } = result.response;
+    if (budgetExhausted || isBudgetExhaustedError(detail) || deps.config.disableStatuses.has(status) ||
+      !deps.config.retryStatuses.has(status) || !([408, 409, 425, 429].includes(status) || status >= 500)) {
+      return false;
+    }
+    try {
+      // Preserve the host's quota/billing veto even when a transient HTTP status
+      // exists. The prefix supplies transient context, never an override of it.
+      return !deps.errorPolicy || deps.errorPolicy.isRetryableAssistantError(
+        syntheticMessage(model, "error", `server error ${status}: ${detail}`),
+      );
+    } catch {
+      return false;
+    }
+  }
+  if (!deps.config.retryNetworkErrors || !deps.errorPolicy) return false;
+  try {
+    return deps.errorPolicy.isRetryableAssistantError(syntheticMessage(model, "error", detail));
+  } catch {
+    return false;
+  }
+}
+
+function nextCooldownDelay(snapshot: PoolSnapshot, targetId: string, now: number): number | undefined {
+  // Never wait for or revive disabled credentials. Existing credential verdicts
+  // and quota cooldowns stay intact; no state reset or provider probe is used.
+  const healthy = snapshot.keys.filter((key) => !key.disabled);
+  const target = snapshot.targets.find((entry) => entry.id === targetId);
+  if (healthy.length === 0 || !target) return undefined;
+  const readyAt = Math.max(
+    snapshot.poolCooldownUntil, target.cooldownUntil,
+    Math.min(...healthy.map((key) => key.cooldownUntil)),
+  );
+  return readyAt > now ? Math.ceil(readyAt - now) : undefined;
+}
+
 function configuredTargetApi(config: RotatorConfig, provider: string): string | undefined {
   const configuredTargets = config.targets?.length
     ? config.targets
@@ -1148,6 +1208,8 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
       const excludedKeyIds = new Set<string>();
       let lastFailure = "no attempt was made";
       let lastDiagnostic: string | undefined;
+      let lastFailureRetryable = false;
+      let cooldownWaitedMs = 0;
 
       for (let attempt = 1; attempt <= deps.config.maxAttemptsPerRequest; attempt += 1) {
         if (options?.signal?.aborted) {
@@ -1169,6 +1231,17 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
         }
         if (!selected) {
           if (excludedKeyIds.size > 0) break;
+          const delayMs = nextCooldownDelay(selection.snapshot, model.provider, (deps.now ?? Date.now)());
+          const remainingWaitMs = (deps.config.maxCooldownWaitMs ?? 0) - cooldownWaitedMs;
+          if (deps.config.retryTransientAtAgentLevel && delayMs !== undefined && delayMs <= remainingWaitMs) {
+            // Waiting does not consume a provider attempt, hold a state lock,
+            // clear health, or make an HTTP request. Re-read shared state after
+            // waking because another process may have changed its cooldown.
+            await (deps.sleep ?? sleepForRecovery)(delayMs, options?.signal);
+            cooldownWaitedMs += delayMs;
+            attempt -= 1;
+            continue;
+          }
           const unavailable = describeUnavailable(selection.snapshot, model.provider, deps.config.cooldownMs);
           emitSyntheticError(
             output,
@@ -1275,6 +1348,7 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
           return;
         }
 
+        lastFailureRetryable = mayRetryTransientAtAgentLevel(deps, result, model);
         let snapshot: PoolSnapshot;
         if (result.outcome === "retry-http" && result.response) {
           snapshot = await deps.pool.recordFailure(
@@ -1313,6 +1387,8 @@ export function createRotatingStream(deps: RotatingStreamDependencies): StreamSi
         "error",
         errorConfig,
         lastDiagnostic,
+        undefined,
+        lastFailureRetryable,
       );
     })().catch((error: unknown) => {
       if (options?.signal?.aborted) {

@@ -95,7 +95,7 @@ export function installRotatorErrorReporting(pi: ExtensionApiLike, configs: read
     try {
       ctx.ui.notify(
         `${formatReport(report)}\nRecent failures: /key-rotator errors`,
-        final.details.reason === "context_overflow" ? "warning" : "error",
+        final.details.reason === "context_overflow" || final.details.reason === "transient_before_output" ? "warning" : "error",
       );
     } catch {
       // An unavailable UI must not break RPC/print requests or recovery.

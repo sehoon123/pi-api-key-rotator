@@ -184,6 +184,8 @@ root. Top-level `pools` cannot be combined with pool fields.
 | `rateLimitScope` | `"key"` | `"key"`, `"target"`, or `"pool"`; applies to `cooldownStatuses` |
 | `targetFailureThreshold` | `2` | 1-100 consecutive transient/network failures before a target circuit opens |
 | `retryNetworkErrors` | `true` | controls same-request failover; target health still updates when false |
+| `retryTransientAtAgentLevel` | `false` | opt in to Pi's bounded outer retry for transient failures before semantic output |
+| `maxCooldownWaitMs` | `0` | cumulative cooldown-wait budget per wrapper invocation, 0-900,000 ms; requires `retryTransientAtAgentLevel: true` |
 | `stateFile` | `<agent dir>/key-rotator-<poolId>.state.json` | absolute, `~`-relative, or relative to the config directory; must not collide with another artifact |
 | `lockTimeoutMs` | `5000` | 100-60,000 ms |
 | `staleLockMs` | `30000` | 1,000-600,000 ms; a live owner is not reclaimed merely because it is old |
@@ -251,7 +253,9 @@ after confirmed replenishment to clear local cooldowns (also clears counters and
 
 For another classified retryable transient status, or a network failure, the selected key's failure
 counter is updated but the key is not cooled or disabled. The target's consecutive-failure count
-increases. At `targetFailureThreshold`, its circuit opens for `transientCooldownMs`. A newer success
+increases. At `targetFailureThreshold`, its circuit opens for `transientCooldownMs`. A transient HTTP
+response with `Retry-After` opens the target circuit immediately for the parsed delay, subject to
+`maxRetryAfterMs`, instead of trying another key against a backend that asked it to wait. A newer success
 clears health for its key and target and clears an older pool cooldown. Attempt ordering prevents an
 older late failure from re-disabling that key or reopening the cleared scope.
 
@@ -307,7 +311,11 @@ semantic output can fail over within the existing network policy, target circuit
 A recognized input/context overflow before output is exposed as `context_length_exceeded` so Pi can
 compact the input and perform its bounded recovery. Authentication failures, conflicting HTTP
 statuses, and failures after visible output do not enter this recovery path. Other finalized errors
-keep a retry-neutral message to avoid replaying output or starting another agent-level retry loop.
+keep a retry-neutral message by default. With `retryTransientAtAgentLevel: true`, pre-output transient
+failures can instead use Pi's configured, bounded agent-level retry. Authentication, exhausted budget,
+user cancellation, state failures, and visible output remain terminal. `maxCooldownWaitMs` additionally
+allows a fresh wrapper to await healthy-key/target cooldowns without sending requests or clearing state.
+See [Unattended recovery](docs/UNATTENDED_RECOVERY.md) for configuration, limits, and verification.
 
 The sanitized cause is shown in a UI notification and `/key-rotator errors`. Up to ten recent reports
 are retained in memory and restored from minimal, non-context session metadata on reload. Reports
@@ -519,6 +527,18 @@ PI_ROTATOR_HOST_ROOT=/absolute/path/to/pi-coding-agent \
 These use fake credentials and loopback HTTP servers to check loading, failover, context recovery,
 final-error budgets, and API fencing. They do not declare full compatibility beyond the pinned
 release contract above.
+
+The opt-in unattended recovery paths also have targeted tests on an installed Pi **1.4.0** host:
+
+```bash
+export PI_ROTATOR_HOST_ROOT=/absolute/path/to/pi-coding-agent
+npm run test:local
+npm run test:reliability
+```
+
+`test:local` resolves peer modules from that host without installing another Pi core. The reliability
+suite uses only temporary agent directories, fake credentials, and loopback HTTP. This targeted check
+is not a full host-compatibility declaration; see [the recovery guide](docs/UNATTENDED_RECOVERY.md).
 
 The two Pi core packages are wildcard peers because Pi supplies them to installed extensions. The
 lockfile pins exact development and contract-test copies to 0.84.2. CI also runs Ubuntu and Windows

@@ -44,6 +44,8 @@
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:local": "node --import ./test/host-peers.mjs --experimental-strip-types --test test/*.test.ts",
+    "test:reliability": "node --test test/local-reliability.integration.mjs",
     "test:coverage": "node --experimental-strip-types --test --experimental-test-coverage --test-coverage-include=src/**/*.ts --test-coverage-lines=85 --test-coverage-branches=70 --test-coverage-functions=80 test/*.test.ts",
     "test:package": "node test/package-smoke.integration.mjs",
     "test:host": "node --experimental-strip-types --test test/actual-host.integration.ts",

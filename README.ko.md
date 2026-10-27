@@ -183,6 +183,8 @@ runtime validation이 최종 기준입니다.
 | `rateLimitScope` | `"key"` | `"key"`, `"target"`, `"pool"` 중 하나. `cooldownStatuses`에 적용. |
 | `targetFailureThreshold` | `2` | 1-100. target circuit을 열기 전 연속 transient/network failure 수. |
 | `retryNetworkErrors` | `true` | 동일 요청 failover를 제어. false여도 network failure는 target health에 기록. |
+| `retryTransientAtAgentLevel` | `false` | semantic output 전 일시 장애만 Pi의 bounded agent-level retry로 이어지게 하는 opt-in. |
+| `maxCooldownWaitMs` | `0` | wrapper 호출당 누적 cooldown 대기 예산, 0-900,000 ms. `retryTransientAtAgentLevel: true` 필요. |
 | `stateFile` | `<agent dir>/key-rotator-<poolId>.state.json` | 절대, `~` 상대, config directory 상대 경로. config/다른 state artifact와 물리적으로 충돌하면 안 됨. |
 | `lockTimeoutMs` | `5000` | 100-60,000 ms. |
 | `staleLockMs` | `30000` | 1,000-600,000 ms. live owner의 lock은 오래됐다는 이유만으로 회수하지 않음. |
@@ -245,7 +247,9 @@ HTTP `429`의 JSON `type` 또는 `code`가 정확히 `budget_exceeded`/`insuffic
 
 다른 retryable transient status 또는 network failure에서는 선택한 key의 failure counter를 올리지만 key를
 cooldown/disable하지 않습니다. target의 consecutive failure가 증가하고 `targetFailureThreshold`에
-도달하면 `transientCooldownMs` 동안 circuit을 엽니다. 더 최신인 success는 해당 key/target health와
+도달하면 `transientCooldownMs` 동안 circuit을 엽니다. transient HTTP 응답에 `Retry-After`가 있으면
+다른 key로 같은 backend를 다시 호출하지 않고, `maxRetryAfterMs` 범위에서 해석한 시간 동안 target
+circuit을 즉시 엽니다. 더 최신인 success는 해당 key/target health와
 더 오래된 pool cooldown을 해제합니다. attempt ordering fence 때문에 더 오래된 late failure가 그 key를
 다시 disable하거나 해제된 scope를 다시 열 수 없습니다.
 
@@ -299,8 +303,11 @@ package entry는 실행 중인 Pi의 public 오류 분류 함수를 주입합니
 
 출력 전에 확인한 입력/context 초과는 `context_length_exceeded`로 전달하여 Pi가 입력을 압축하고
 bounded recovery를 수행할 수 있게 합니다. 인증 오류, 상충하는 HTTP status, 이미 출력이 보인 뒤의 오류는
-이 복구 경로에 넣지 않습니다. 나머지 최종 오류는 retry-neutral 문구를 유지하여 중복 출력과 별도
-agent-level retry loop를 막습니다.
+이 복구 경로에 넣지 않습니다. 나머지 최종 오류는 기본적으로 retry-neutral 문구를 유지합니다.
+`retryTransientAtAgentLevel: true`를 선택하면 출력 전 일시 장애만 Pi 설정의 bounded agent-level retry로
+이어집니다. 인증 실패, 예산 소진, 사용자 취소, state 오류, 이미 출력이 보인 뒤의 오류는 계속 중단합니다.
+`maxCooldownWaitMs`를 설정하면 새 wrapper는 상태 초기화나 provider 요청 없이 정상 key/target의
+cooldown이 끝나기를 기다릴 수 있습니다. 설정 예와 한계는 [무인 실행 복구 가이드](docs/UNATTENDED_RECOVERY.md)를 참고하세요.
 
 정제된 원인은 UI 알림과 `/key-rotator errors`에서 확인합니다. 최근 보고서 10개를 memory에 유지하고,
 최소한의 non-context session metadata로 저장하여 reload 때 복원합니다. 보고서에는 prompt, assistant
@@ -515,6 +522,18 @@ PI_ROTATOR_HOST_ROOT=/absolute/path/to/pi-coding-agent \
 
 가짜 credential과 loopback HTTP 서버로 loading, failover, context recovery, 최종 오류 budget,
 API fence를 검증합니다. 위 pinned release contract를 넘어서는 전체 호환성 선언은 아닙니다.
+
+설치된 Pi **1.4.0**에서는 opt-in 무인 실행 복구 경로를 다음과 같이 추가 검증합니다.
+
+```bash
+export PI_ROTATOR_HOST_ROOT=/absolute/path/to/pi-coding-agent
+npm run test:local
+npm run test:reliability
+```
+
+`test:local`은 Pi core를 새로 설치하지 않고 해당 host의 peer module을 사용합니다. reliability suite는
+임시 agent directory, 가짜 credential, loopback HTTP만 사용합니다. 전체 host 호환성 선언은 아니며
+[복구 가이드](docs/UNATTENDED_RECOVERY.md)에 검증 범위와 제한을 설명합니다.
 
 Pi core package 두 개는 installed extension에 Pi가 제공하므로 wildcard peer입니다. lockfile은 development와
 contract test용 copy를 정확한 0.84.2로 고정합니다. CI는 Ubuntu/Windows와 Node 22.19/24를 실행합니다.

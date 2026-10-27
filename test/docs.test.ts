@@ -12,6 +12,7 @@ const markdownFiles = [
   "docs/MULTI_POOL.md",
   "docs/PI_INTERNALS.md",
   "docs/SECRETS.md",
+  "docs/UNATTENDED_RECOVERY.md",
 ];
 
 async function text(path: string): Promise<string> {
